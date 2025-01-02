@@ -3,10 +3,10 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"io"
 	"io/ioutil"
 	"os"
 	"strconv"
-	"time"
 
 	"github.com/harlow/go-micro-services/registry"
 	"github.com/harlow/go-micro-services/services/geo"
@@ -14,13 +14,21 @@ import (
 	"github.com/harlow/go-micro-services/tune"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"github.com/trevorrobertsjr/datadogwriter"
 )
 
 func main() {
 	tune.Init()
-	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}).With().Timestamp().Caller().Logger()
+	// Configure logger
+	datadogWriter := &datadogwriter.DatadogWriter{
+		Service:  "geo",
+		Hostname: "localhost",
+		Tags:     "env:staging,version:1.0",
+		Source:   "geo-service",
+	}
+	log.Logger = zerolog.New(io.MultiWriter(os.Stdout, datadogWriter)).With().Timestamp().Logger()
 
-	log.Info().Msg("Reading config...")
+	log.Info().Msg("Reading config locally...")
 	jsonFile, err := os.Open("config.json")
 	if err != nil {
 		log.Error().Msgf("Got error while reading config: %v", err)
