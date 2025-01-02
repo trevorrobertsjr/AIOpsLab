@@ -62,8 +62,10 @@ services:
     environment:
       - TLS
       - GC
-      - JAEGER_SAMPLE_RATIO
-      - LOG_LEVEL
+      - JAEGER_SAMPLE_RATIO=1
+      - LOG_LEVEL=info
+      - DD_API_KEY=${DD_API_KEY}
+      - DD_SITE=${DD_SITE:-us5.datadoghq.com}
     build: .
     image: hotel_reserv_geo_single_node
     entrypoint: geo
