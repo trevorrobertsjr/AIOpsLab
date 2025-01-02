@@ -3,9 +3,9 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"io"
 	"io/ioutil"
 	"os"
-	"time"
 
 	"strconv"
 
@@ -15,11 +15,18 @@ import (
 	"github.com/harlow/go-micro-services/tune"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"github.com/trevorrobertsjr/datadogwriter"
 )
 
 func main() {
 	tune.Init()
-	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}).With().Timestamp().Caller().Logger()
+	datadogWriter := &datadogwriter.DatadogWriter{
+		Service:  "search",
+		Hostname: "localhost",
+		Tags:     "env:staging,version:1.0",
+		Source:   "search-service",
+	}
+	log.Logger = zerolog.New(io.MultiWriter(os.Stdout, datadogWriter)).With().Timestamp().Logger()
 
 	log.Info().Msg("Reading config...")
 	jsonFile, err := os.Open("config.json")
