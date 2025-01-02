@@ -24,7 +24,7 @@ func initializeDatabase(url string) *mgo.Session {
 
 	// Add credentials to the MongoDB connection URL
 	url = "mongodb://" + adminUsername + ":" + adminPassword + "@" + url
-	url = "mongodb://" + "@" + url
+	// url = "mongodb://" + "@" + url
 
 	log.Info().Msg(url)
 

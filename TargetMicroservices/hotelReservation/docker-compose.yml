@@ -225,6 +225,9 @@ services:
     container_name: 'hotel_reserv_geo_mongo'
     # hostname: geo-db
     restart: always
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin # Set admin username
+      MONGO_INITDB_ROOT_PASSWORD: admin # Set admin password
     volumes:
       - geo:/data/db  
 
@@ -233,6 +236,9 @@ services:
     container_name: 'hotel_reserv_profile_mongo'
     hostname: profile-db
     restart: always
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin # Set admin username
+      MONGO_INITDB_ROOT_PASSWORD: admin # Set admin password
     volumes:
       - profile:/data/db    
 
@@ -241,6 +247,9 @@ services:
     container_name: 'hotel_reserv_rate_mongo'
     hostname: rate-db
     restart: always
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin # Set admin username
+      MONGO_INITDB_ROOT_PASSWORD: admin # Set admin password
     volumes:
       - rate:/data/db   
 
@@ -249,6 +258,9 @@ services:
     hostname: recommendation-db
     container_name: 'hotel_reserv_recommendation_mongo'
     restart: always
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin # Set admin username
+      MONGO_INITDB_ROOT_PASSWORD: admin # Set admin password
     volumes:
       - recommendation:/data/db
     
@@ -257,6 +269,9 @@ services:
     container_name: 'hotel_reserv_reservation_mongo'
     hostname: reservation-db
     restart: always
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin # Set admin username
+      MONGO_INITDB_ROOT_PASSWORD: admin # Set admin password
     volumes:
       - reservation:/data/db 
 
@@ -265,6 +280,9 @@ services:
     container_name: 'hotel_reserv_user_mongo'
     hostname: user-db
     restart: always
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin # Set admin username
+      MONGO_INITDB_ROOT_PASSWORD: admin # Set admin password
     volumes:
       - user:/data/db
     
