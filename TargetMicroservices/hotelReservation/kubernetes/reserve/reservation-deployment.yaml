@@ -28,7 +28,7 @@ spec:
       containers:
         - command:
             - reservation
-          image: yinfangchen/hotelreservation:latest
+          image: trevorrobertsjr/aiopslab-hotelreservation-aio:latest
           name: hotel-reserv-reservation
           ports:
             - containerPort: 8087

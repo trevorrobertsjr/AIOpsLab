@@ -32,7 +32,7 @@ spec:
       containers:
         - command:
             - frontend
-          image: yinfangchen/hotelreservation:latest
+          image: trevorrobertsjr/aiopslab-hotelreservation-aio:latest
           name: hotel-reserv-frontend
           ports:
             - containerPort: 5000
