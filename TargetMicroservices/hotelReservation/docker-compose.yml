@@ -16,7 +16,7 @@ services:
     restart: always
 
   otel-collector:
-    image: otel/opentelemetry-collector:latest
+    image: otel/opentelemetry-collector-contrib:latest
     container_name: otel_collector
     ports:
       - "4317:4317" # gRPC receiver
