@@ -1,29 +1,53 @@
 package dialer
 
 import (
+	"context"
 	"fmt"
 	"time"
 
-	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
 	"github.com/harlow/go-micro-services/tls"
 	consul "github.com/hashicorp/consul/api"
 	lb "github.com/olivere/grpc/lb/consul"
-	opentracing "github.com/opentracing/opentracing-go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 )
 
-// DialOption allows optional config for dialer
-type DialOption func(name string) (grpc.DialOption, error)
+// tracerStatsHandler implements gRPC stats.Handler to propagate Datadog spans.
+type tracerStatsHandler struct{}
 
-// WithTracer traces rpc calls
-func WithTracer(tracer opentracing.Tracer) DialOption {
+func (t *tracerStatsHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
+	span, ctx := tracer.StartSpanFromContext(ctx, info.FullMethodName, tracer.SpanType(ext.SpanTypeRPC))
+	return tracer.ContextWithSpan(ctx, span)
+}
+
+func (t *tracerStatsHandler) HandleRPC(ctx context.Context, stats stats.RPCStats) {
+	span := tracer.SpanFromContext(ctx)
+	if span == nil {
+		return
+	}
+
+	if errStats, ok := stats.(*stats.End); ok && errStats.Error != nil {
+		span.SetTag(ext.Error, errStats.Error)
+	}
+	span.Finish()
+}
+
+func (t *tracerStatsHandler) TagConn(ctx context.Context, _ *stats.ConnTagInfo) context.Context {
+	return ctx
+}
+
+func (t *tracerStatsHandler) HandleConn(context.Context, stats.ConnStats) {}
+
+// WithTracer enables Datadog tracing for gRPC calls
+func WithTracer() DialOption {
 	return func(name string) (grpc.DialOption, error) {
-		return grpc.WithUnaryInterceptor(otgrpc.OpenTracingClientInterceptor(tracer)), nil
+		return grpc.WithStatsHandler(&tracerStatsHandler{}), nil
 	}
 }
 
-// WithBalancer enables client side load balancing
+// WithBalancer enables client-side load balancing
 func WithBalancer(registry *consul.Client) DialOption {
 	return func(name string) (grpc.DialOption, error) {
 		r, err := lb.NewResolver(registry, name, "")
@@ -34,9 +58,8 @@ func WithBalancer(registry *consul.Client) DialOption {
 	}
 }
 
-// Dial returns a load balanced grpc client conn with tracing interceptor
+// Dial returns a load-balanced gRPC client conn with tracing and optional configurations
 func Dial(name string, opts ...DialOption) (*grpc.ClientConn, error) {
-
 	dialopts := []grpc.DialOption{
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Timeout:             120 * time.Second,

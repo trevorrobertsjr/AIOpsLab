@@ -3,39 +3,57 @@ package rate
 import (
 	"encoding/json"
 	"fmt"
-
-	"gopkg.in/mgo.v2"
-	"gopkg.in/mgo.v2/bson"
-
-	// "io/ioutil"
 	"net"
-	// "os"
 	"sort"
-	"time"
+	"strings"
 	"sync"
+	"time"
 
-	"github.com/rs/zerolog/log"
-
+	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/google/uuid"
-	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
 	"github.com/harlow/go-micro-services/registry"
 	pb "github.com/harlow/go-micro-services/services/rate/proto"
 	"github.com/harlow/go-micro-services/tls"
-	"github.com/opentracing/opentracing-go"
+	"github.com/rs/zerolog/log"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
-
-	"strings"
-
-	"github.com/bradfitz/gomemcache/memcache"
+	"google.golang.org/grpc/stats"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
+	"gopkg.in/mgo.v2"
+	"gopkg.in/mgo.v2/bson"
 )
 
 const name = "srv-rate"
 
+// tracerStatsHandler implements gRPC stats.Handler for Datadog tracing.
+type tracerStatsHandler struct{}
+
+func (t *tracerStatsHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
+	span, ctx := tracer.StartSpanFromContext(ctx, info.FullMethodName, tracer.SpanType(ext.SpanTypeRPC))
+	return tracer.ContextWithSpan(ctx, span)
+}
+
+func (t *tracerStatsHandler) HandleRPC(ctx context.Context, stats stats.RPCStats) {
+	span := tracer.SpanFromContext(ctx)
+	if span == nil {
+		return
+	}
+	if errStats, ok := stats.(*stats.End); ok && errStats.Error != nil {
+		span.SetTag(ext.Error, errStats.Error)
+	}
+	span.Finish()
+}
+
+func (t *tracerStatsHandler) TagConn(ctx context.Context, _ *stats.ConnTagInfo) context.Context {
+	return ctx
+}
+
+func (t *tracerStatsHandler) HandleConn(context.Context, stats.ConnStats) {}
+
 // Server implements the rate service
 type Server struct {
-	Tracer       opentracing.Tracer
 	Port         int
 	IpAddr       string
 	MongoSession *mgo.Session
@@ -46,7 +64,7 @@ type Server struct {
 
 // Run starts the server
 func (s *Server) Run() error {
-	opentracing.SetGlobalTracer(s.Tracer)
+	// opentracing.SetGlobalTracer(s.Tracer) // Commented for potential reversion
 
 	if s.Port == 0 {
 		return fmt.Errorf("server port must be set")
@@ -61,9 +79,7 @@ func (s *Server) Run() error {
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			PermitWithoutStream: true,
 		}),
-		grpc.UnaryInterceptor(
-			otgrpc.OpenTracingServerInterceptor(s.Tracer),
-		),
+		grpc.StatsHandler(&tracerStatsHandler{}), // Datadog tracing
 	}
 
 	if tlsopt := tls.GetServerOpt(); tlsopt != nil {
@@ -76,22 +92,10 @@ func (s *Server) Run() error {
 
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
 	if err != nil {
-		log.Fatal().Msgf("failed to listen: %v", err)
+		log.Fatal().Msgf("Failed to listen: %v", err)
 	}
 
-	// register the service
-	// jsonFile, err := os.Open("config.json")
-	// if err != nil {
-	// 	fmt.Println(err)
-	// }
-
-	// defer jsonFile.Close()
-
-	// byteValue, _ := ioutil.ReadAll(jsonFile)
-
-	// var result map[string]string
-	// json.Unmarshal([]byte(byteValue), &result)
-
+	// Register the service
 	err = s.Registry.Register(name, s.uuid, s.IpAddr, s.Port)
 	if err != nil {
 		return fmt.Errorf("failed register: %v", err)
@@ -109,12 +113,6 @@ func (s *Server) Shutdown() {
 // GetRates gets rates for hotels for specific date range.
 func (s *Server) GetRates(ctx context.Context, req *pb.Request) (*pb.Result, error) {
 	res := new(pb.Result)
-	// session, err := mgo.Dial("mongodb-rate")
-	// if err != nil {
-	// 	panic(err)
-	// }
-	// defer session.Close()
-
 	ratePlans := make(RatePlans, 0)
 
 	hotelIds := []string{}
@@ -123,19 +121,21 @@ func (s *Server) GetRates(ctx context.Context, req *pb.Request) (*pb.Result, err
 		hotelIds = append(hotelIds, hotelID)
 		rateMap[hotelID] = struct{}{}
 	}
-	// first check memcached(get-multi)
-	memSpan, _ := opentracing.StartSpanFromContext(ctx, "memcached_get_multi_rate")
-	memSpan.SetTag("span.kind", "client")
+
+	memSpan, ctx := tracer.StartSpanFromContext(ctx, "memcached.get_multi_rate", tracer.SpanType(ext.SpanTypeCache))
+	memSpan.SetTag(ext.Component, "memcached")
+	memSpan.SetTag(ext.PeerService, "memcached-rate")
 	resMap, err := s.MemcClient.GetMulti(hotelIds)
 	memSpan.Finish()
+
 	var wg sync.WaitGroup
 	var mutex sync.Mutex
 	if err != nil && err != memcache.ErrCacheMiss {
-		log.Panic().Msgf("Memmcached error while trying to get hotel [id: %v]= %s", hotelIds, err)
+		log.Panic().Msgf("Memcached error while trying to get hotel [id: %v]: %v", hotelIds, err)
 	} else {
 		for hotelId, item := range resMap {
 			rateStrs := strings.Split(string(item.Value), "\n")
-			log.Trace().Msgf("memc hit, hotelId = %s,rate strings: %v", hotelId, rateStrs)
+			log.Trace().Msgf("Memcached hit, hotelId = %s, rate strings: %v", hotelId, rateStrs)
 
 			for _, rateStr := range rateStrs {
 				if len(rateStr) != 0 {
@@ -149,36 +149,31 @@ func (s *Server) GetRates(ctx context.Context, req *pb.Request) (*pb.Result, err
 		wg.Add(len(rateMap))
 		for hotelId := range rateMap {
 			go func(id string) {
-				log.Trace().Msgf("memc miss, hotelId = %s", id)
-				log.Trace().Msg("memcached miss, set up mongo connection")
-
-				// memcached miss, set up mongo connection
+				defer wg.Done()
 				session := s.MongoSession.Copy()
 				defer session.Close()
 				c := session.DB("rate-db").C("inventory")
-				memcStr := ""
+
 				tmpRatePlans := make(RatePlans, 0)
-				mongoSpan, _ := opentracing.StartSpanFromContext(ctx, "mongo_rate")
-				mongoSpan.SetTag("span.kind", "client")
+				mongoSpan, ctx := tracer.StartSpanFromContext(ctx, "mongo.query", tracer.SpanType(ext.SpanTypeDB))
+				mongoSpan.SetTag(ext.DBInstance, "rate-db")
+				mongoSpan.SetTag(ext.DBStatement, fmt.Sprintf("Find rates for hotel ID: %s", id))
 				err := c.Find(&bson.M{"hotelId": id}).All(&tmpRatePlans)
 				mongoSpan.Finish()
-				if err != nil {
-					log.Panic().Msgf("Tried to find hotelId [%v], but got error", id, err.Error())
-				} else {
-					for _, r := range tmpRatePlans {
-						mutex.Lock()
-						ratePlans = append(ratePlans, r)
-						mutex.Unlock()
-						rateJson, err := json.Marshal(r)
-						if err != nil {
-							log.Error().Msgf("Failed to marshal plan [Code: %v] with error: %s", r.Code, err)
-						}
-						memcStr = memcStr + string(rateJson) + "\n"
-					}
-				}
-				go s.MemcClient.Set(&memcache.Item{Key: id, Value: []byte(memcStr)})
 
-				defer wg.Done()
+				if err != nil {
+					log.Panic().Msgf("Failed to find rates for hotel ID [%v]: %v", id, err)
+					return
+				}
+				memcStr := ""
+				for _, r := range tmpRatePlans {
+					mutex.Lock()
+					ratePlans = append(ratePlans, r)
+					mutex.Unlock()
+					rateJson, _ := json.Marshal(r)
+					memcStr += string(rateJson) + "\n"
+				}
+				s.MemcClient.Set(&memcache.Item{Key: id, Value: []byte(memcStr)})
 			}(hotelId)
 		}
 	}
@@ -190,6 +185,7 @@ func (s *Server) GetRates(ctx context.Context, req *pb.Request) (*pb.Result, err
 	return res, nil
 }
 
+// RatePlans implements sorting for rate plans
 type RatePlans []*pb.RatePlan
 
 func (r RatePlans) Len() int {

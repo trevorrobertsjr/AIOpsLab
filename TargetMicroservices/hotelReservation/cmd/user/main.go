@@ -51,21 +51,21 @@ func main() {
 	serv_ip := result["UserIP"]
 	log.Info().Msgf("Read target port: %v", serv_port)
 	log.Info().Msgf("Read consul address: %v", result["consulAddress"])
-	log.Info().Msgf("Read jaeger address: %v", result["jaegerAddress"])
+	// log.Info().Msgf("Read jaeger address: %v", result["jaegerAddress"])
 
 	var (
 		// port       = flag.Int("port", 8086, "The server port")
-		jaegeraddr = flag.String("jaegeraddr", result["jaegerAddress"], "Jaeger server addr")
+		// jaegeraddr = flag.String("jaegeraddr", result["jaegerAddress"], "Jaeger server addr")
 		consuladdr = flag.String("consuladdr", result["consulAddress"], "Consul address")
 	)
 	flag.Parse()
 
 	log.Info().Msgf("Initializing jaeger agent [service name: %v | host: %v]...", "user", *jaegeraddr)
 	tracer, err := tracing.Init("user", *jaegeraddr)
-	if err != nil {
-		log.Panic().Msgf("Got error while initializing jaeger agent: %v", err)
-	}
-	log.Info().Msg("Jaeger agent initialized")
+	//	if err != nil {
+	//		log.Panic().Msgf("Got error while initializing jaeger agent: %v", err)
+	//	}
+	//	log.Info().Msg("Jaeger agent initialized")
 
 	log.Info().Msgf("Initializing consul agent [host: %v]...", *consuladdr)
 	registry, err := registry.NewClient(*consuladdr)
@@ -75,7 +75,7 @@ func main() {
 	log.Info().Msg("Consul agent initialized")
 
 	srv := &user.Server{
-		Tracer: tracer,
+		//		Tracer: tracer,
 		// Port:     *port,
 		Registry:     registry,
 		Port:         serv_port,

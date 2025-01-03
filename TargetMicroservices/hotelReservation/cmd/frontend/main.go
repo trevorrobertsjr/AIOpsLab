@@ -10,15 +10,25 @@ import (
 
 	"github.com/harlow/go-micro-services/registry"
 	"github.com/harlow/go-micro-services/services/frontend"
-	"github.com/harlow/go-micro-services/tracing"
 	"github.com/harlow/go-micro-services/tune"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/trevorrobertsjr/datadogwriter"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 )
 
 func main() {
 	tune.Init()
+	// Configure tracing
+	tracer.Start(
+		tracer.WithEnv("staging"),
+		tracer.WithService("frontend"),
+		tracer.WithServiceVersion("1.0"),
+	)
+	// When the tracer is stopped, it will flush everything it has to the Datadog Agent before quitting.
+	// Make sure this line stays in your main function.
+	defer tracer.Stop()
+
 	// Configure logger
 	datadogWriter := &datadogwriter.DatadogWriter{
 		Service:  "frontend",
@@ -46,19 +56,19 @@ func main() {
 
 	log.Info().Msgf("Read target port: %v", serv_port)
 	log.Info().Msgf("Read consul address: %v", result["consulAddress"])
-	log.Info().Msgf("Read jaeger address: %v", result["jaegerAddress"])
+	// log.Info().Msgf("Read jaeger address: %v", result["jaegerAddress"])
 	var (
 		// port       = flag.Int("port", 5000, "The server port")
 		jaegeraddr = flag.String("jaegeraddr", result["jaegerAddress"], "Jaeger address")
 		consuladdr = flag.String("consuladdr", result["consulAddress"], "Consul address")
 	)
 	flag.Parse()
-	log.Info().Msgf("Initializing jaeger agent [service name: %v | host: %v]...", "frontend", *jaegeraddr)
-	tracer, err := tracing.Init("frontend", *jaegeraddr)
-	if err != nil {
-		log.Panic().Msgf("Got error while initializing jaeger agent: %v", err)
-	}
-	log.Info().Msg("Jaeger agent initialized")
+	// log.Info().Msgf("Initializing jaeger agent [service name: %v | host: %v]...", "frontend", *jaegeraddr)
+	// tracer, err := tracing.Init("frontend", *jaegeraddr)
+	// if err != nil {
+	// 	log.Panic().Msgf("Got error while initializing jaeger agent: %v", err)
+	// }
+	// log.Info().Msg("Jaeger agent initialized")
 
 	log.Info().Msgf("Initializing consul agent [host: %v]...", *consuladdr)
 	registry, err := registry.NewClient(*consuladdr)
@@ -70,9 +80,9 @@ func main() {
 	srv := &frontend.Server{
 		KnativeDns: knative_dns,
 		Registry:   registry,
-		Tracer:     tracer,
-		IpAddr:     serv_ip,
-		Port:       serv_port,
+		// Tracer:     tracer,
+		IpAddr: serv_ip,
+		Port:   serv_port,
 	}
 
 	log.Info().Msg("Starting server...")

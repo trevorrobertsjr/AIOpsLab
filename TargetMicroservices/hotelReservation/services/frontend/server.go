@@ -18,8 +18,8 @@ import (
 	profile "github.com/harlow/go-micro-services/services/profile/proto"
 	search "github.com/harlow/go-micro-services/services/search/proto"
 	"github.com/harlow/go-micro-services/tls"
-	"github.com/harlow/go-micro-services/tracing"
-	"github.com/opentracing/opentracing-go"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 )
 
 // Server implements frontend service
@@ -32,8 +32,8 @@ type Server struct {
 	KnativeDns           string
 	IpAddr               string
 	Port                 int
-	Tracer               opentracing.Tracer
-	Registry             *registry.Client
+	// Tracer               tracer.Tracer
+	Registry *registry.Client
 }
 
 // Run the server
@@ -65,12 +65,12 @@ func (s *Server) Run() error {
 	log.Info().Msg("Successfull")
 
 	log.Trace().Msg("frontend before mux")
-	mux := tracing.NewServeMux(s.Tracer)
+	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.Dir("services/frontend/static")))
-	mux.Handle("/hotels", http.HandlerFunc(s.searchHandler))
-	mux.Handle("/recommendations", http.HandlerFunc(s.recommendHandler))
-	mux.Handle("/user", http.HandlerFunc(s.userHandler))
-	mux.Handle("/reservation", http.HandlerFunc(s.reservationHandler))
+	mux.Handle("/hotels", tracer.WrapHandler(http.HandlerFunc(s.searchHandler), tracer.ServiceName("frontend")))
+	mux.Handle("/recommendations", tracer.WrapHandler(http.HandlerFunc(s.recommendHandler), tracer.ServiceName("frontend")))
+	mux.Handle("/user", tracer.WrapHandler(http.HandlerFunc(s.userHandler), tracer.ServiceName("frontend")))
+	mux.Handle("/reservation", tracer.WrapHandler(http.HandlerFunc(s.reservationHandler), tracer.ServiceName("frontend")))
 
 	log.Trace().Msg("frontend starts serving")
 
@@ -140,12 +140,13 @@ func (s *Server) getGprcConn(name string) (*grpc.ClientConn, error) {
 	log.Info().Msg(fmt.Sprintf("%s.%s", name, s.KnativeDns))
 	if s.KnativeDns != "" {
 		return dialer.Dial(
-			fmt.Sprintf("%s.%s", name, s.KnativeDns),
-			dialer.WithTracer(s.Tracer))
+			fmt.Sprintf("%s.%s", name, s.KnativeDns)
+			// dialer.WithTracer(s.Tracer))
+		)
 	} else {
 		return dialer.Dial(
 			name,
-			dialer.WithTracer(s.Tracer),
+			// dialer.WithTracer(s.Tracer),
 			dialer.WithBalancer(s.Registry.Client),
 		)
 	}
@@ -155,12 +156,17 @@ func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	ctx := r.Context()
 
+	// Start a new Datadog span
+	span, ctx := tracer.StartSpanFromContext(ctx, "frontend.searchHandler", tracer.ServiceName("frontend"))
+	defer span.Finish()
+
 	log.Trace().Msg("starts searchHandler")
 
 	// in/out dates from query params
 	inDate, outDate := r.URL.Query().Get("inDate"), r.URL.Query().Get("outDate")
 	if inDate == "" || outDate == "" {
 		http.Error(w, "Please specify inDate/outDate params", http.StatusBadRequest)
+		span.SetTag(ext.Error, true)
 		return
 	}
 
