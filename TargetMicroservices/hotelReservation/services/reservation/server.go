@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	"github.com/google/uuid"
-	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
 	"github.com/harlow/go-micro-services/registry"
 	pb "github.com/harlow/go-micro-services/services/reservation/proto"
 	"github.com/harlow/go-micro-services/tls"
@@ -13,6 +12,9 @@ import (
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/stats"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
 
@@ -24,12 +26,47 @@ import (
 	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/rs/zerolog/log"
 
-	"strings"
 	"strconv"
+	"strings"
 	"sync"
 )
 
 const name = "srv-reservation"
+
+type tracerStatsHandler struct{}
+
+func (t *tracerStatsHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
+	span, ctx := tracer.StartSpanFromContext(ctx, info.FullMethodName, tracer.ResourceName("grpc"))
+	return tracer.ContextWithSpan(ctx, span)
+}
+
+func (t *tracerStatsHandler) HandleRPC(ctx context.Context, rpcStats stats.RPCStats) {
+	span, ok := tracer.SpanFromContext(ctx)
+	if !ok {
+		return
+	}
+
+	switch event := rpcStats.(type) {
+	case *stats.InPayload:
+		span.SetTag("event", "in_payload")
+		span.SetTag("bytes_received", event.Length)
+	case *stats.OutPayload:
+		span.SetTag("event", "out_payload")
+		span.SetTag("bytes_sent", event.Length)
+	case *stats.End:
+		if event.Error != nil {
+			span.SetTag(ext.Error, event.Error)
+		}
+	}
+
+	span.Finish()
+}
+
+func (t *tracerStatsHandler) TagConn(ctx context.Context, _ *stats.ConnTagInfo) context.Context {
+	return ctx
+}
+
+func (t *tracerStatsHandler) HandleConn(context.Context, stats.ConnStats) {}
 
 // Server implements the user service
 type Server struct {
@@ -59,9 +96,7 @@ func (s *Server) Run() error {
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			PermitWithoutStream: true,
 		}),
-		grpc.UnaryInterceptor(
-			otgrpc.OpenTracingServerInterceptor(s.Tracer),
-		),
+		grpc.StatsHandler(&tracerStatsHandler{}), // Updated to use Datadog tracing
 	}
 
 	if tlsopt := tls.GetServerOpt(); tlsopt != nil {
@@ -254,7 +289,9 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 		resMap[hotelId] = true
 		keysMap[hotelId+"_cap"] = struct{}{}
 	}
-	capMemSpan, _ := opentracing.StartSpanFromContext(ctx, "memcached_capacity_get_multi_number")
+	capMemSpan, _ := tracer.StartSpanFromContext(ctx, "memcached.query", tracer.ResourceName("memcached_capacity_get_multi_number"))
+	capMemSpan.SetTag(ext.Component, "memcached")
+	capMemSpan.SetTag(ext.SpanType, "cache")
 	capMemSpan.SetTag("span.kind", "client")
 	cacheMemRes, err := s.MemcClient.GetMulti(hotelMemKeys)
 	capMemSpan.Finish()
@@ -283,7 +320,7 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 		nums := []number{}
 		capMongoSpan, _ := opentracing.StartSpanFromContext(ctx, "mongodb_capacity_get_multi_number")
 		capMongoSpan.SetTag("span.kind", "client")
-		err = c1.Find(bson.M{"hotelId": bson.M{"$in": queryMissKeys}}).All(&nums) 
+		err = c1.Find(bson.M{"hotelId": bson.M{"$in": queryMissKeys}}).All(&nums)
 		capMongoSpan.Finish()
 		if err != nil {
 			log.Panic().Msgf("Tried to find hotelId [%v], but got error", misKeys, err.Error())
@@ -323,7 +360,10 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 		hotelId  string
 		checkRes bool
 	}
-	reserveMemSpan, _ := opentracing.StartSpanFromContext(ctx, "memcached_reserve_get_multi_number")
+	reserveMemSpan, _ := tracer.StartSpanFromContext(ctx, "memcached_reservation_get_multi", tracer.ResourceName("MakeReservation"))
+	reserveMemSpan.SetTag(ext.Component, "memcached")
+	reserveMemSpan.SetTag(ext.SpanType, "cache")
+
 	ch := make(chan taskRes)
 	reserveMemSpan.SetTag("span.kind", "client")
 	// check capacity in memcached and mongodb
@@ -370,7 +410,9 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 					defer tmpSess.Close()
 					queryItem := queryMap[comm]
 					c := tmpSess.DB("reservation-db").C("reservation")
-					reserveMongoSpan, _ := opentracing.StartSpanFromContext(ctx, "mongodb_capacity_get_multi_number"+comm)
+					reserveMongoSpan, _ := tracer.StartSpanFromContext(ctx, "mongodb.query", tracer.ResourceName("Find reservation"))
+					reserveMongoSpan.SetTag(ext.DBInstance, "reservation-db")
+					reserveMongoSpan.SetTag(ext.DBStatement, fmt.Sprintf("Find reservation for hotelId=%s", queryItem["hotelId"]))
 					reserveMongoSpan.SetTag("span.kind", "client")
 					err := c.Find(&bson.M{"hotelId": queryItem["hotelId"], "inDate": queryItem["startDate"], "outDate": queryItem["endDate"]}).All(&reserve)
 					reserveMongoSpan.Finish()

@@ -27,18 +27,32 @@ const name = "srv-search"
 type tracerStatsHandler struct{}
 
 func (t *tracerStatsHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
-	span, ctx := tracer.StartSpanFromContext(ctx, info.FullMethodName, tracer.SpanType(ext.SpanTypeRPC))
+	span, ctx := tracer.StartSpanFromContext(ctx, info.FullMethodName, tracer.ResourceName("grpc"))
 	return tracer.ContextWithSpan(ctx, span)
 }
 
-func (t *tracerStatsHandler) HandleRPC(ctx context.Context, stats stats.RPCStats) {
-	span := tracer.SpanFromContext(ctx)
-	if span == nil {
+func (t *tracerStatsHandler) HandleRPC(ctx context.Context, rpcStats stats.RPCStats) {
+	span, ok := tracer.SpanFromContext(ctx)
+	if !ok {
 		return
 	}
-	if errStats, ok := stats.(*stats.End); ok && errStats.Error != nil {
-		span.SetTag(ext.Error, errStats.Error)
+
+	// Handle specific RPC stats events
+	switch statsEvent := rpcStats.(type) {
+	case *stats.InPayload:
+		span.SetTag("event", "in_payload")
+		span.SetTag("bytes_received", statsEvent.Length)
+	case *stats.OutPayload:
+		span.SetTag("event", "out_payload")
+		span.SetTag("bytes_sent", statsEvent.Length)
+	case *stats.End:
+		if statsEvent.Error != nil {
+			span.SetTag(ext.Error, statsEvent.Error)
+		}
+	default:
+		span.SetTag("event", "unknown")
 	}
+
 	span.Finish()
 }
 
@@ -74,7 +88,7 @@ func (s *Server) Run() error {
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			PermitWithoutStream: true,
 		}),
-		grpc.StatsHandler(&tracerStatsHandler{}), // Datadog tracing
+		grpc.StatsHandler(&tracerStatsHandler{}),
 	}
 
 	if tlsopt := tls.GetServerOpt(); tlsopt != nil {
@@ -130,15 +144,17 @@ func (s *Server) initRateClient(name string) error {
 }
 
 func (s *Server) getGrpcConn(name string) (*grpc.ClientConn, error) {
+	// If Knative DNS is configured, use it for the service address
 	if s.KnativeDns != "" {
-		return dialer.Dial(
-			fmt.Sprintf("%s.%s", name, s.KnativeDns),
-		)
+		target := fmt.Sprintf("%s.%s", name, s.KnativeDns)
+		log.Info().Msgf("Dialing Knative DNS target: %s", target)
+		return dialer.Dial(target)
 	}
-	return dialer.Dial(
-		name,
-		dialer.WithBalancer(s.Registry.Client),
-	)
+
+	// Default to Consul-based service discovery
+	target := fmt.Sprintf("consul:///%s", name)
+	log.Info().Msgf("Dialing Consul target: %s", target)
+	return dialer.Dial(target)
 }
 
 // Nearby returns IDs of nearby hotels ordered by ranking algo

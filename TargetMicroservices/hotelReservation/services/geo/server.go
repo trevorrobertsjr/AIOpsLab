@@ -31,17 +31,21 @@ const (
 type tracerStatsHandler struct{}
 
 func (t *tracerStatsHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
-	span, ctx := tracer.StartSpanFromContext(ctx, info.FullMethodName, tracer.SpanType(ext.SpanTypeRPC))
+	span, ctx := tracer.StartSpanFromContext(ctx, info.FullMethodName, tracer.Tag(ext.SpanKind, ext.SpanKindServer))
 	return tracer.ContextWithSpan(ctx, span)
 }
 
-func (t *tracerStatsHandler) HandleRPC(ctx context.Context, stats stats.RPCStats) {
-	span := tracer.SpanFromContext(ctx)
-	if span == nil {
+func (t *tracerStatsHandler) HandleRPC(ctx context.Context, rpcStats stats.RPCStats) {
+	span, ok := tracer.SpanFromContext(ctx)
+	if !ok {
 		return
 	}
-	if errStats, ok := stats.(*stats.End); ok && errStats.Error != nil {
-		span.SetTag(ext.Error, errStats.Error)
+
+	switch statsEvent := rpcStats.(type) {
+	case *stats.End:
+		if statsEvent.Error != nil {
+			span.SetTag(ext.Error, statsEvent.Error)
+		}
 	}
 	span.Finish()
 }
@@ -154,15 +158,22 @@ func newGeoIndex(session *mgo.Session) *geoindex.ClusteringIndex {
 
 	s := session.Copy()
 	defer s.Close()
+
+	// Start span for MongoDB query
+	mongoSpan := tracer.StartSpan("mongo.query", tracer.Tag(ext.DBType, "mongo"))
+	mongoSpan.SetTag(ext.DBInstance, "geo-db")
+	mongoSpan.SetTag(ext.DBStatement, "Fetching all geo points")
+	defer mongoSpan.Finish()
+
 	c := s.DB("geo-db").C("geo")
 
 	var points []*point
 	err := c.Find(bson.M{}).All(&points)
 	if err != nil {
 		log.Error().Msgf("Failed get geo data: %v", err)
+		mongoSpan.SetTag(ext.Error, err)
 	}
 
-	// add points to index
 	index := geoindex.NewClusteringIndex()
 	for _, point := range points {
 		index.Add(point)

@@ -18,7 +18,6 @@ import (
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
-	"google.golang.org/grpc/stats"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 	"gopkg.in/mgo.v2"
@@ -26,31 +25,6 @@ import (
 )
 
 const name = "srv-rate"
-
-// tracerStatsHandler implements gRPC stats.Handler for Datadog tracing.
-type tracerStatsHandler struct{}
-
-func (t *tracerStatsHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
-	span, ctx := tracer.StartSpanFromContext(ctx, info.FullMethodName, tracer.SpanType(ext.SpanTypeRPC))
-	return tracer.ContextWithSpan(ctx, span)
-}
-
-func (t *tracerStatsHandler) HandleRPC(ctx context.Context, stats stats.RPCStats) {
-	span := tracer.SpanFromContext(ctx)
-	if span == nil {
-		return
-	}
-	if errStats, ok := stats.(*stats.End); ok && errStats.Error != nil {
-		span.SetTag(ext.Error, errStats.Error)
-	}
-	span.Finish()
-}
-
-func (t *tracerStatsHandler) TagConn(ctx context.Context, _ *stats.ConnTagInfo) context.Context {
-	return ctx
-}
-
-func (t *tracerStatsHandler) HandleConn(context.Context, stats.ConnStats) {}
 
 // Server implements the rate service
 type Server struct {
@@ -64,8 +38,6 @@ type Server struct {
 
 // Run starts the server
 func (s *Server) Run() error {
-	// opentracing.SetGlobalTracer(s.Tracer) // Commented for potential reversion
-
 	if s.Port == 0 {
 		return fmt.Errorf("server port must be set")
 	}
@@ -79,7 +51,6 @@ func (s *Server) Run() error {
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			PermitWithoutStream: true,
 		}),
-		grpc.StatsHandler(&tracerStatsHandler{}), // Datadog tracing
 	}
 
 	if tlsopt := tls.GetServerOpt(); tlsopt != nil {
@@ -87,7 +58,6 @@ func (s *Server) Run() error {
 	}
 
 	srv := grpc.NewServer(opts...)
-
 	pb.RegisterRateServer(srv, s)
 
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
@@ -95,10 +65,9 @@ func (s *Server) Run() error {
 		log.Fatal().Msgf("Failed to listen: %v", err)
 	}
 
-	// Register the service
 	err = s.Registry.Register(name, s.uuid, s.IpAddr, s.Port)
 	if err != nil {
-		return fmt.Errorf("failed register: %v", err)
+		return fmt.Errorf("failed to register: %v", err)
 	}
 	log.Info().Msg("Successfully registered in consul")
 
@@ -110,8 +79,10 @@ func (s *Server) Shutdown() {
 	s.Registry.Deregister(s.uuid)
 }
 
-// GetRates gets rates for hotels for specific date range.
+// GetRates gets rates for hotels for a specific date range.
 func (s *Server) GetRates(ctx context.Context, req *pb.Request) (*pb.Result, error) {
+	log.Trace().Msg("In GetRates")
+
 	res := new(pb.Result)
 	ratePlans := make(RatePlans, 0)
 
@@ -122,7 +93,7 @@ func (s *Server) GetRates(ctx context.Context, req *pb.Request) (*pb.Result, err
 		rateMap[hotelID] = struct{}{}
 	}
 
-	memSpan, ctx := tracer.StartSpanFromContext(ctx, "memcached.get_multi_rate", tracer.SpanType(ext.SpanTypeCache))
+	memSpan, _ := tracer.StartSpanFromContext(ctx, "memcached.get_multi_rate", tracer.Tag(ext.SpanType, "cache"))
 	memSpan.SetTag(ext.Component, "memcached")
 	memSpan.SetTag(ext.PeerService, "memcached-rate")
 	resMap, err := s.MemcClient.GetMulti(hotelIds)
@@ -155,7 +126,7 @@ func (s *Server) GetRates(ctx context.Context, req *pb.Request) (*pb.Result, err
 				c := session.DB("rate-db").C("inventory")
 
 				tmpRatePlans := make(RatePlans, 0)
-				mongoSpan, ctx := tracer.StartSpanFromContext(ctx, "mongo.query", tracer.SpanType(ext.SpanTypeDB))
+				mongoSpan, _ := tracer.StartSpanFromContext(ctx, "mongo.query", tracer.Tag(ext.SpanType, "db"))
 				mongoSpan.SetTag(ext.DBInstance, "rate-db")
 				mongoSpan.SetTag(ext.DBStatement, fmt.Sprintf("Find rates for hotel ID: %s", id))
 				err := c.Find(&bson.M{"hotelId": id}).All(&tmpRatePlans)

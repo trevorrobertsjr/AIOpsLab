@@ -27,18 +27,31 @@ const name = "srv-user"
 type tracerStatsHandler struct{}
 
 func (t *tracerStatsHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
-	span, ctx := tracer.StartSpanFromContext(ctx, info.FullMethodName, tracer.SpanType(ext.SpanTypeRPC))
+	span, ctx := tracer.StartSpanFromContext(ctx, info.FullMethodName, tracer.ResourceName("grpc"))
 	return tracer.ContextWithSpan(ctx, span)
 }
 
-func (t *tracerStatsHandler) HandleRPC(ctx context.Context, stats stats.RPCStats) {
-	span := tracer.SpanFromContext(ctx)
-	if span == nil {
+func (t *tracerStatsHandler) HandleRPC(ctx context.Context, rpcStats stats.RPCStats) {
+	span, ok := tracer.SpanFromContext(ctx)
+	if !ok {
 		return
 	}
-	if errStats, ok := stats.(*stats.End); ok && errStats.Error != nil {
-		span.SetTag(ext.Error, errStats.Error)
+
+	switch statsEvent := rpcStats.(type) {
+	case *stats.InPayload:
+		span.SetTag("event", "in_payload")
+		span.SetTag("bytes_received", statsEvent.Length)
+	case *stats.OutPayload:
+		span.SetTag("event", "out_payload")
+		span.SetTag("bytes_sent", statsEvent.Length)
+	case *stats.End:
+		if statsEvent.Error != nil {
+			span.SetTag(ext.Error, statsEvent.Error)
+		}
+	default:
+		span.SetTag("event", "unknown")
 	}
+
 	span.Finish()
 }
 
@@ -50,8 +63,7 @@ func (t *tracerStatsHandler) HandleConn(context.Context, stats.ConnStats) {}
 
 // Server implements the user service
 type Server struct {
-	users map[string]string
-	// Tracer       opentracing.Tracer
+	users        map[string]string
 	Registry     *registry.Client
 	Port         int
 	IpAddr       string
@@ -91,7 +103,7 @@ func (s *Server) Run() error {
 
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
 	if err != nil {
-		log.Fatal().Msgf("failed to listen: %v", err)
+		log.Fatal().Msgf("Failed to listen: %v", err)
 	}
 
 	// // register the service
@@ -133,22 +145,9 @@ func (s *Server) CheckUser(ctx context.Context, req *pb.Request) (*pb.Result, er
 	sum := sha256.Sum256([]byte(req.Password))
 	pass := fmt.Sprintf("%x", sum)
 
-	// session, err := mgo.Dial("mongodb-user")
-	// if err != nil {
-	// 	panic(err)
-	// }
-	// defer session.Close()
-
-	// c := session.DB("user-db").C("user")
-
-	// user := User{}
-	// err = c.Find(bson.M{"username": req.Username}).One(&user)
-	// if err != nil {
-	// 	panic(err)
-	// }
 	res.Correct = false
-	if true_pass, found := s.users[req.Username]; found {
-		res.Correct = pass == true_pass
+	if truePass, found := s.users[req.Username]; found {
+		res.Correct = pass == truePass
 		if !res.Correct {
 			span.SetTag(ext.Error, true)
 		}
@@ -157,29 +156,21 @@ func (s *Server) CheckUser(ctx context.Context, req *pb.Request) (*pb.Result, er
 		span.SetTag(ext.Error, true)
 	}
 
-	// res.Correct = user.Password == pass
-
-	log.Trace().Msgf("CheckUser %d", res.Correct)
+	log.Trace().Msgf("CheckUser result: %v", res.Correct)
 
 	return res, nil
 }
 
-// loadUsers loads hotel users from mongodb.
+// loadUsers loads hotel users from MongoDB.
 func loadUsers(session *mgo.Session) map[string]string {
-	// session, err := mgo.Dial("mongodb-user")
-	// if err != nil {
-	// 	panic(err)
-	// }
-	// defer session.Close()
 	s := session.Copy()
 	defer s.Close()
 	c := s.DB("user-db").C("user")
 
-	// unmarshal json profiles
 	var users []User
 	err := c.Find(bson.M{}).All(&users)
 	if err != nil {
-		log.Error().Msgf("Failed get users data: ", err)
+		log.Error().Msgf("Failed to get users data: %v", err)
 	}
 
 	res := make(map[string]string)
@@ -187,7 +178,7 @@ func loadUsers(session *mgo.Session) map[string]string {
 		res[user.Username] = user.Password
 	}
 
-	log.Trace().Msg("Done load users")
+	log.Trace().Msg("Done loading users")
 
 	return res
 }

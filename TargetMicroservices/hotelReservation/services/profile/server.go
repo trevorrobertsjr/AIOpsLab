@@ -29,18 +29,32 @@ const name = "srv-profile"
 type tracerStatsHandler struct{}
 
 func (t *tracerStatsHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
-	span, ctx := tracer.StartSpanFromContext(ctx, info.FullMethodName, tracer.SpanType(ext.SpanTypeRPC))
+	span, ctx := tracer.StartSpanFromContext(ctx, info.FullMethodName, tracer.Tag(ext.SpanType, "rpc"))
 	return tracer.ContextWithSpan(ctx, span)
 }
 
-func (t *tracerStatsHandler) HandleRPC(ctx context.Context, stats stats.RPCStats) {
-	span := tracer.SpanFromContext(ctx)
-	if span == nil {
+func (t *tracerStatsHandler) HandleRPC(ctx context.Context, rpcStats stats.RPCStats) {
+	span, ok := tracer.SpanFromContext(ctx)
+	if !ok {
 		return
 	}
-	if errStats, ok := stats.(*stats.End); ok && errStats.Error != nil {
-		span.SetTag(ext.Error, errStats.Error)
+
+	// Handle specific RPC stats events
+	switch statsEvent := rpcStats.(type) {
+	case *stats.InPayload:
+		span.SetTag("event", "in_payload")
+		span.SetTag("bytes_received", statsEvent.Length)
+	case *stats.OutPayload:
+		span.SetTag("event", "out_payload")
+		span.SetTag("bytes_sent", statsEvent.Length)
+	case *stats.End:
+		if statsEvent.Error != nil {
+			span.SetTag(ext.Error, statsEvent.Error)
+		}
+	default:
+		span.SetTag("event", "unknown")
 	}
+
 	span.Finish()
 }
 
@@ -122,7 +136,7 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 		profileMap[hotelId] = struct{}{}
 	}
 
-	memSpan, ctx := tracer.StartSpanFromContext(ctx, "memcached.get_profile", tracer.SpanType(ext.SpanTypeCache))
+	memSpan, _ := tracer.StartSpanFromContext(ctx, "memcached.get_profile", tracer.Tag(ext.SpanType, "cache"))
 	memSpan.SetTag(ext.Component, "memcached")
 	memSpan.SetTag(ext.PeerService, "memcached-profile")
 	resMap, err := s.MemcClient.GetMulti(hotelIds)
@@ -147,7 +161,7 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 			c := session.DB("profile-db").C("hotels")
 
 			hotelProf := new(pb.Hotel)
-			mongoSpan, ctx := tracer.StartSpanFromContext(ctx, "mongo.query", tracer.SpanType(ext.SpanTypeDB))
+			mongoSpan, _ := tracer.StartSpanFromContext(ctx, "mongo.query", tracer.Tag(ext.SpanType, "db"))
 			mongoSpan.SetTag(ext.DBInstance, "profile-db")
 			mongoSpan.SetTag(ext.DBStatement, fmt.Sprintf("Find hotel by ID: %s", hotelId))
 			err := c.Find(bson.M{"id": hotelId}).One(&hotelProf)

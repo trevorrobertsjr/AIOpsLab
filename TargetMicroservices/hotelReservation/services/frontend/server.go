@@ -18,6 +18,7 @@ import (
 	profile "github.com/harlow/go-micro-services/services/profile/proto"
 	search "github.com/harlow/go-micro-services/services/search/proto"
 	"github.com/harlow/go-micro-services/tls"
+	httptrace "gopkg.in/DataDog/dd-trace-go.v1/contrib/net/http"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 )
@@ -65,12 +66,12 @@ func (s *Server) Run() error {
 	log.Info().Msg("Successfull")
 
 	log.Trace().Msg("frontend before mux")
-	mux := http.NewServeMux()
+	mux := httptrace.NewServeMux()
 	mux.Handle("/", http.FileServer(http.Dir("services/frontend/static")))
-	mux.Handle("/hotels", tracer.WrapHandler(http.HandlerFunc(s.searchHandler), tracer.ServiceName("frontend")))
-	mux.Handle("/recommendations", tracer.WrapHandler(http.HandlerFunc(s.recommendHandler), tracer.ServiceName("frontend")))
-	mux.Handle("/user", tracer.WrapHandler(http.HandlerFunc(s.userHandler), tracer.ServiceName("frontend")))
-	mux.Handle("/reservation", tracer.WrapHandler(http.HandlerFunc(s.reservationHandler), tracer.ServiceName("frontend")))
+	mux.Handle("/hotels", httptrace.WrapHandler(http.HandlerFunc(s.searchHandler), "frontend", "/hotels"))
+	mux.Handle("/recommendations", httptrace.WrapHandler(http.HandlerFunc(s.recommendHandler), "frontend", "/recommendations"))
+	mux.Handle("/user", httptrace.WrapHandler(http.HandlerFunc(s.userHandler), "frontend", "/user"))
+	mux.Handle("/reservation", httptrace.WrapHandler(http.HandlerFunc(s.reservationHandler), "frontend", "/reservation"))
 
 	log.Trace().Msg("frontend starts serving")
 
@@ -90,7 +91,7 @@ func (s *Server) Run() error {
 }
 
 func (s *Server) initSearchClient(name string) error {
-	conn, err := s.getGprcConn(name)
+	conn, err := s.getGrpcConn(name)
 	if err != nil {
 		return fmt.Errorf("dialer error: %v", err)
 	}
@@ -99,7 +100,7 @@ func (s *Server) initSearchClient(name string) error {
 }
 
 func (s *Server) initProfileClient(name string) error {
-	conn, err := s.getGprcConn(name)
+	conn, err := s.getGrpcConn(name)
 	if err != nil {
 		return fmt.Errorf("dialer error: %v", err)
 	}
@@ -108,7 +109,7 @@ func (s *Server) initProfileClient(name string) error {
 }
 
 func (s *Server) initRecommendationClient(name string) error {
-	conn, err := s.getGprcConn(name)
+	conn, err := s.getGrpcConn(name)
 	if err != nil {
 		return fmt.Errorf("dialer error: %v", err)
 	}
@@ -117,7 +118,7 @@ func (s *Server) initRecommendationClient(name string) error {
 }
 
 func (s *Server) initUserClient(name string) error {
-	conn, err := s.getGprcConn(name)
+	conn, err := s.getGrpcConn(name)
 	if err != nil {
 		return fmt.Errorf("dialer error: %v", err)
 	}
@@ -126,7 +127,7 @@ func (s *Server) initUserClient(name string) error {
 }
 
 func (s *Server) initReservation(name string) error {
-	conn, err := s.getGprcConn(name)
+	conn, err := s.getGrpcConn(name)
 	if err != nil {
 		return fmt.Errorf("dialer error: %v", err)
 	}
@@ -134,22 +135,18 @@ func (s *Server) initReservation(name string) error {
 	return nil
 }
 
-func (s *Server) getGprcConn(name string) (*grpc.ClientConn, error) {
-	log.Info().Msg("get Grpc conn is :")
-	log.Info().Msg(s.KnativeDns)
-	log.Info().Msg(fmt.Sprintf("%s.%s", name, s.KnativeDns))
+func (s *Server) getGrpcConn(name string) (*grpc.ClientConn, error) {
+	// If Knative DNS is configured, use it for the service address
 	if s.KnativeDns != "" {
-		return dialer.Dial(
-			fmt.Sprintf("%s.%s", name, s.KnativeDns)
-			// dialer.WithTracer(s.Tracer))
-		)
-	} else {
-		return dialer.Dial(
-			name,
-			// dialer.WithTracer(s.Tracer),
-			dialer.WithBalancer(s.Registry.Client),
-		)
+		target := fmt.Sprintf("%s.%s", name, s.KnativeDns)
+		log.Info().Msgf("Dialing Knative DNS target: %s", target)
+		return dialer.Dial(target)
 	}
+
+	// Default to Consul-based service discovery
+	target := fmt.Sprintf("consul:///%s", name)
+	log.Info().Msgf("Dialing Consul target: %s", target)
+	return dialer.Dial(target)
 }
 
 func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
