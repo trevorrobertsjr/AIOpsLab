@@ -10,16 +10,27 @@ import (
 
 	"github.com/harlow/go-micro-services/registry"
 	"github.com/harlow/go-micro-services/services/user"
-	"github.com/harlow/go-micro-services/tracing"
 	"github.com/harlow/go-micro-services/tune"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/trevorrobertsjr/datadogwriter"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 )
 
 func main() {
 	tune.Init()
 	// initializeDatabase()
+	// Configure tracing
+	tracer.Start(
+		tracer.WithEnv("staging"),
+		tracer.WithService("user"),
+		tracer.WithServiceVersion("1.0"),
+	)
+	// When the tracer is stopped, it will flush everything it has to the Datadog Agent before quitting.
+	// Make sure this line stays in your main function.
+	defer tracer.Stop()
+
+	// Configure logging
 	datadogWriter := &datadogwriter.DatadogWriter{
 		Service:  "user",
 		Hostname: "localhost",
@@ -60,8 +71,8 @@ func main() {
 	)
 	flag.Parse()
 
-	log.Info().Msgf("Initializing jaeger agent [service name: %v | host: %v]...", "user", *jaegeraddr)
-	tracer, err := tracing.Init("user", *jaegeraddr)
+	// log.Info().Msgf("Initializing jaeger agent [service name: %v | host: %v]...", "user", *jaegeraddr)
+	// tracer, err := tracing.Init("user", *jaegeraddr)
 	//	if err != nil {
 	//		log.Panic().Msgf("Got error while initializing jaeger agent: %v", err)
 	//	}

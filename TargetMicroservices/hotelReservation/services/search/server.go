@@ -1,38 +1,57 @@
 package search
 
 import (
-	// "encoding/json"
 	"fmt"
-	// F"io/ioutil"
 	"net"
-
-	"github.com/rs/zerolog/log"
-
-	// "os"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
 	"github.com/harlow/go-micro-services/dialer"
 	"github.com/harlow/go-micro-services/registry"
 	geo "github.com/harlow/go-micro-services/services/geo/proto"
 	rate "github.com/harlow/go-micro-services/services/rate/proto"
 	pb "github.com/harlow/go-micro-services/services/search/proto"
 	"github.com/harlow/go-micro-services/tls"
-	opentracing "github.com/opentracing/opentracing-go"
-	context "golang.org/x/net/context"
+	"github.com/rs/zerolog/log"
+	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/stats"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 )
 
 const name = "srv-search"
 
-// Server implments the search service
+// tracerStatsHandler implements gRPC stats.Handler for Datadog tracing.
+type tracerStatsHandler struct{}
+
+func (t *tracerStatsHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
+	span, ctx := tracer.StartSpanFromContext(ctx, info.FullMethodName, tracer.SpanType(ext.SpanTypeRPC))
+	return tracer.ContextWithSpan(ctx, span)
+}
+
+func (t *tracerStatsHandler) HandleRPC(ctx context.Context, stats stats.RPCStats) {
+	span := tracer.SpanFromContext(ctx)
+	if span == nil {
+		return
+	}
+	if errStats, ok := stats.(*stats.End); ok && errStats.Error != nil {
+		span.SetTag(ext.Error, errStats.Error)
+	}
+	span.Finish()
+}
+
+func (t *tracerStatsHandler) TagConn(ctx context.Context, _ *stats.ConnTagInfo) context.Context {
+	return ctx
+}
+
+func (t *tracerStatsHandler) HandleConn(context.Context, stats.ConnStats) {}
+
+// Server implements the search service
 type Server struct {
 	geoClient  geo.GeoClient
 	rateClient rate.RateClient
-
-	Tracer     opentracing.Tracer
 	Port       int
 	IpAddr     string
 	KnativeDns string
@@ -55,9 +74,7 @@ func (s *Server) Run() error {
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			PermitWithoutStream: true,
 		}),
-		grpc.UnaryInterceptor(
-			otgrpc.OpenTracingServerInterceptor(s.Tracer),
-		),
+		grpc.StatsHandler(&tracerStatsHandler{}), // Datadog tracing
 	}
 
 	if tlsopt := tls.GetServerOpt(); tlsopt != nil {
@@ -67,7 +84,7 @@ func (s *Server) Run() error {
 	srv := grpc.NewServer(opts...)
 	pb.RegisterSearchServer(srv, s)
 
-	// init grpc clients
+	// Initialize gRPC clients
 	if err := s.initGeoClient("srv-geo"); err != nil {
 		return err
 	}
@@ -77,25 +94,12 @@ func (s *Server) Run() error {
 
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
 	if err != nil {
-		log.Fatal().Msgf("failed to listen: %v", err)
+		log.Fatal().Msgf("Failed to listen: %v", err)
 	}
-
-	// register with consul
-	// jsonFile, err := os.Open("config.json")
-	// if err != nil {
-	// 	fmt.Println(err)
-	// }
-
-	// defer jsonFile.Close()
-
-	// byteValue, _ := ioutil.ReadAll(jsonFile)
-
-	// var result map[string]string
-	// json.Unmarshal([]byte(byteValue), &result)
 
 	err = s.Registry.Register(name, s.uuid, s.IpAddr, s.Port)
 	if err != nil {
-		return fmt.Errorf("failed register: %v", err)
+		return fmt.Errorf("Failed to register: %v", err)
 	}
 	log.Info().Msg("Successfully registered in consul")
 
@@ -108,76 +112,65 @@ func (s *Server) Shutdown() {
 }
 
 func (s *Server) initGeoClient(name string) error {
-	conn, err := s.getGprcConn(name)
+	conn, err := s.getGrpcConn(name)
 	if err != nil {
-		return fmt.Errorf("dialer error: %v", err)
+		return fmt.Errorf("Dialer error: %v", err)
 	}
 	s.geoClient = geo.NewGeoClient(conn)
 	return nil
 }
 
 func (s *Server) initRateClient(name string) error {
-	conn, err := s.getGprcConn(name)
+	conn, err := s.getGrpcConn(name)
 	if err != nil {
-		return fmt.Errorf("dialer error: %v", err)
+		return fmt.Errorf("Dialer error: %v", err)
 	}
 	s.rateClient = rate.NewRateClient(conn)
 	return nil
 }
 
-func (s *Server) getGprcConn(name string) (*grpc.ClientConn, error) {
+func (s *Server) getGrpcConn(name string) (*grpc.ClientConn, error) {
 	if s.KnativeDns != "" {
 		return dialer.Dial(
 			fmt.Sprintf("%s.%s", name, s.KnativeDns),
-			dialer.WithTracer(s.Tracer))
-	} else {
-		return dialer.Dial(
-			name,
-			dialer.WithTracer(s.Tracer),
-			dialer.WithBalancer(s.Registry.Client),
 		)
 	}
+	return dialer.Dial(
+		name,
+		dialer.WithBalancer(s.Registry.Client),
+	)
 }
 
-// Nearby returns ids of nearby hotels ordered by ranking algo
+// Nearby returns IDs of nearby hotels ordered by ranking algo
 func (s *Server) Nearby(ctx context.Context, req *pb.NearbyRequest) (*pb.SearchResult, error) {
-	// find nearby hotels
-	log.Trace().Msg("in Search Nearby")
+	span, ctx := tracer.StartSpanFromContext(ctx, "search.Nearby", tracer.ResourceName("Nearby"))
+	defer span.Finish()
 
-	log.Trace().Msgf("nearby lat = %f", req.Lat)
-	log.Trace().Msgf("nearby lon = %f", req.Lon)
+	log.Trace().Msg("In Search Nearby")
 
 	nearby, err := s.geoClient.Nearby(ctx, &geo.Request{
 		Lat: req.Lat,
 		Lon: req.Lon,
 	})
 	if err != nil {
+		span.SetTag(ext.Error, true)
 		return nil, err
 	}
 
-	for _, hid := range nearby.HotelIds {
-		log.Trace().Msgf("get Nearby hotelId = %s", hid)
-	}
-
-	// find rates for hotels
+	// Find rates for hotels
 	rates, err := s.rateClient.GetRates(ctx, &rate.Request{
 		HotelIds: nearby.HotelIds,
 		InDate:   req.InDate,
 		OutDate:  req.OutDate,
 	})
 	if err != nil {
+		span.SetTag(ext.Error, true)
 		return nil, err
 	}
 
-	// TODO(hw): add simple ranking algo to order hotel ids:
-	// * geo distance
-	// * price (best discount?)
-	// * reviews
-
-	// build the response
+	// Build the response
 	res := new(pb.SearchResult)
 	for _, ratePlan := range rates.RatePlans {
-		log.Trace().Msgf("get RatePlan HotelId = %s, Code = %s", ratePlan.HotelId, ratePlan.Code)
 		res.HotelIds = append(res.HotelIds, ratePlan.HotelId)
 	}
 	return res, nil

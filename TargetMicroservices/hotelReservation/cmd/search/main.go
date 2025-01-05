@@ -11,15 +11,26 @@ import (
 
 	"github.com/harlow/go-micro-services/registry"
 	"github.com/harlow/go-micro-services/services/search"
-	"github.com/harlow/go-micro-services/tracing"
 	"github.com/harlow/go-micro-services/tune"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/trevorrobertsjr/datadogwriter"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 )
 
 func main() {
 	tune.Init()
+	// Configure tracing
+	tracer.Start(
+		tracer.WithEnv("staging"),
+		tracer.WithService("search"),
+		tracer.WithServiceVersion("1.0"),
+	)
+	// When the tracer is stopped, it will flush everything it has to the Datadog Agent before quitting.
+	// Make sure this line stays in your main function.
+	defer tracer.Stop()
+
+	// Configure logging
 	datadogWriter := &datadogwriter.DatadogWriter{
 		Service:  "search",
 		Hostname: "localhost",
@@ -50,13 +61,13 @@ func main() {
 
 	var (
 		// port       = flag.Int("port", 8082, "The server port")
-		jaegeraddr = flag.String("jaegeraddr", result["jaegerAddress"], "Jaeger address")
+		// jaegeraddr = flag.String("jaegeraddr", result["jaegerAddress"], "Jaeger address")
 		consuladdr = flag.String("consuladdr", result["consulAddress"], "Consul address")
 	)
 	flag.Parse()
 
-	log.Info().Msgf("Initializing jaeger agent [service name: %v | host: %v]...", "search", *jaegeraddr)
-	tracer, err := tracing.Init("search", *jaegeraddr)
+	// log.Info().Msgf("Initializing jaeger agent [service name: %v | host: %v]...", "search", *jaegeraddr)
+	// tracer, err := tracing.Init("search", *jaegeraddr)
 	//	if err != nil {
 	//		log.Panic().Msgf("Got error while initializing jaeger agent: %v", err)
 	//	}
