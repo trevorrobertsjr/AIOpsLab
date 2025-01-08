@@ -19,12 +19,17 @@ func NewClient(addr string) (*Client, error) {
 		return nil, err
 	}
 
-	return &Client{c}, nil
+	return &Client{
+		Client:  c,
+		address: addr, // Set the address field
+	}, nil
+
 }
 
 // Client provides an interface for communicating with registry
 type Client struct {
 	*consul.Client
+	address string
 }
 
 // Look for the network device being dedicated for gRPC traffic.
@@ -87,9 +92,23 @@ func (c *Client) Register(name string, id string, ip string, port int) error {
 		Name:    name,
 		Port:    port,
 		Address: ip,
+		// Check: &consul.AgentServiceCheck{
+		// 	// Use TTL-based check and always update it to "passing"
+		// 	TTL:    "30s",
+		// 	Status: "passing", // Force passing status
+		// },
 	}
 	log.Info().Msgf("Trying to register service [ name: %s, id: %s, address: %s:%d ]", name, id, ip, port)
 	return c.Agent().ServiceRegister(reg)
+}
+
+func (c *Client) Address() string {
+	// if c.address == "" {
+	// 	log.Error().Msg("Consul address is not set in registry.Client")
+	// 	return "consul:8500" // Optional: fallback to a default address if appropriate
+	// }
+	// return c.address
+	return "consul:8500"
 }
 
 // Deregister removes the service address from registry

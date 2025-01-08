@@ -29,16 +29,43 @@ spec:
         - command:
             - reservation
           image: trevorrobertsjr/aiopslab-hotelreservation-aio:latest
+          # securityContext:
+          #   privileged: true
           name: hotel-reserv-reservation
           ports:
             - containerPort: 8087
           env:
             - name: JAEGER_SAMPLE_RATIO
               value: "1"
+            - name: DD_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: dd-api-key
+                  key: api-key
+#            - name: DD_SITE
+#              valueFrom:
+#                configMapKeyRef:
+#                  name: dd-site
+#                  key: site
+            - name: DD_SERVICE
+              value: "reservation"
+            - name: DD_ENV
+              value: "staging"
+            - name: DD_VERSION
+              value: "1.0"
+            - name: DD_TRACE_AGENT_URL
+              value: "unix:///var/run/datadog/apm.socket"
+          volumeMounts:
+            - mountPath: /var/run/datadog
+              name: "apmsocketpath"
           resources:
             requests:
               cpu: 100m
             limits:
               cpu: 1000m
+      volumes:
+        - hostPath:
+            path: /var/run/datadog
+          name: "apmsocketpath"
       restartPolicy: Always
 status: {}

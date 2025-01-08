@@ -24,12 +24,12 @@ type consulResolverBuilder struct {
 func (b *consulResolverBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts resolver.BuildOptions) (resolver.Resolver, error) {
 	r := &consulResolver{
 		client: b.client,
-		// Correctly retrieve the string value of the target's Endpoint
-		target: target.Endpoint(), // Call the function to get the string value
+		target: target.Endpoint(),
 		cc:     cc,
 		stopCh: make(chan struct{}),
 	}
-	go r.watchConsul()
+	go r.watchAgent()
+	fmt.Printf("Consul resolver created for target: %s\n", target.Endpoint())
 	return r, nil
 }
 
@@ -38,7 +38,7 @@ func (b *consulResolverBuilder) Scheme() string {
 	return "consul"
 }
 
-// consulResolver watches for updates to the Consul service and updates the gRPC resolver state.
+// consulResolver watches for updates to the Consul Agent services and updates the gRPC resolver state.
 type consulResolver struct {
 	client *api.Client
 	target string
@@ -46,89 +46,89 @@ type consulResolver struct {
 	stopCh chan struct{}
 }
 
-// watchConsul continuously fetches service updates from Consul and updates the resolver state.
-func (r *consulResolver) watchConsul() {
+func (r *consulResolver) watchAgent() {
+	// connected := false
+	// Normalize target by stripping the "consul:///" prefix
+	normalizedTarget := r.target
+	if len(normalizedTarget) > 10 && normalizedTarget[:10] == "consul:///" {
+		normalizedTarget = normalizedTarget[10:]
+	}
 	for {
 		select {
 		case <-r.stopCh:
 			return
 		default:
-			services, _, err := r.client.Health().Service(r.target, "", true, nil)
+
+			services, err := r.client.Agent().Services()
 			if err != nil {
-				fmt.Printf("Failed to resolve services: %v\n", err)
+				fmt.Printf("[%s] Failed to resolve services for target %s: %v\n",
+					time.Now().Format("2006-01-02 15:04:05"), r.target, err)
+				// connected = false
 				time.Sleep(5 * time.Second)
 				continue
 			}
 
-			addresses := make([]resolver.Address, 0, len(services))
+			var addresses []resolver.Address
 			for _, service := range services {
-				addr := service.Service.Address
-				if addr == "" {
-					addr = service.Node.Address
+				// fmt.Printf("[%s] Trying %s == %s", time.Now().Format("2006-01-02 15:04:05"), service.Service, normalizedTarget)
+				if service.Service == normalizedTarget {
+					addresses = append(addresses, resolver.Address{
+						Addr: fmt.Sprintf("%s:%d", service.Address, service.Port),
+					})
+					lastItem := ""
+					if len(addresses) > 0 {
+						lastItem = addresses[len(addresses)-1].Addr
+						// fmt.Println("Last item:", lastItem)
+					}
+					fmt.Printf("Added service %s for target %s with address %s", service.Service, r.target, lastItem)
 				}
-				addresses = append(addresses, resolver.Address{
-					Addr: fmt.Sprintf("%s:%d", addr, service.Service.Port),
-				})
 			}
+
 			r.cc.UpdateState(resolver.State{Addresses: addresses})
+
+			// if !connected {
+			// 	fmt.Printf("[%s] Successfully connected to service: %s\n",
+			// 		time.Now().Format("2006-01-02 15:04:05"), r.target)
+			// 	connected = true
+			// }
+
 			time.Sleep(5 * time.Second)
 		}
 	}
 }
 
-// ResolveNow is a no-op for this resolver.
-func (r *consulResolver) ResolveNow(options resolver.ResolveNowOptions) {}
-
-// Close stops the resolver.
-func (r *consulResolver) Close() {
-	close(r.stopCh)
-}
+func (r *consulResolver) ResolveNow(_ resolver.ResolveNowOptions) {}
+func (r *consulResolver) Close()                                  { close(r.stopCh) }
 
 // tracerStatsHandler implements gRPC stats.Handler for Datadog tracing.
 type tracerStatsHandler struct{}
 
-// TagRPC creates a new span for RPC calls and attaches it to the context.
 func (t *tracerStatsHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
 	span, ctx := tracer.StartSpanFromContext(ctx, info.FullMethodName, tracer.Tag(ext.SpanType, "rpc"))
 	return tracer.ContextWithSpan(ctx, span)
 }
 
-// HandleRPC handles RPC events and adds relevant tags to the span.
 func (t *tracerStatsHandler) HandleRPC(ctx context.Context, rpcStats stats.RPCStats) {
 	span, ok := tracer.SpanFromContext(ctx)
 	if !ok {
 		return
 	}
-
-	// Handle specific RPC stats events
 	switch statsEvent := rpcStats.(type) {
 	case *stats.InPayload:
-		span.SetTag("event", "in_payload")
 		span.SetTag("bytes_received", statsEvent.Length)
 	case *stats.OutPayload:
-		span.SetTag("event", "out_payload")
 		span.SetTag("bytes_sent", statsEvent.Length)
-	case *stats.InHeader:
-		span.SetTag("event", "in_header")
-	case *stats.OutHeader:
-		span.SetTag("event", "out_header")
 	case *stats.End:
 		if statsEvent.Error != nil {
 			span.SetTag(ext.Error, statsEvent.Error)
 		}
-	default:
-		span.SetTag("event", "unknown")
 	}
-
 	span.Finish()
 }
 
-// TagConn creates a span for connection-level events.
 func (t *tracerStatsHandler) TagConn(ctx context.Context, _ *stats.ConnTagInfo) context.Context {
 	return ctx
 }
-
-// HandleConn handles connection-level events (currently a no-op).
 func (t *tracerStatsHandler) HandleConn(context.Context, stats.ConnStats) {}
 
 // WithTracer enables Datadog tracing for gRPC calls.
@@ -139,49 +139,60 @@ func WithTracer() DialOption {
 }
 
 // DialOption allows optional configurations for gRPC Dial.
-type DialOption func(name string) (grpc.DialOption, error)
+type DialOption func(target string) (grpc.DialOption, error)
 
-// Dial creates a gRPC connection to the target service.
 func Dial(target string, opts ...DialOption) (*grpc.ClientConn, error) {
-	dialopts := []grpc.DialOption{
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Timeout:             120 * time.Second,
-			PermitWithoutStream: true,
-		}),
+	consulAddr := "consul.test-hotel-reservation.svc.cluster.local:8500" // Set DNS name directly
+	dialopts := []grpc.DialOption{}
+
+	// Process DialOptions
+	for _, opt := range opts {
+		dialOption, err := opt(target)
+		if err != nil {
+			return nil, fmt.Errorf("failed to process DialOption: %v", err)
+		}
+		dialopts = append(dialopts, dialOption)
 	}
 
-	// Use TLS if available
+	fmt.Printf("Dialing Consul target [%s] at address [%s]\n", target, consulAddr)
+
+	// Add default gRPC options
+	dialopts = append(dialopts, grpc.WithKeepaliveParams(keepalive.ClientParameters{
+		Timeout:             120 * time.Second,
+		PermitWithoutStream: true,
+	}))
+	dialopts = append(dialopts, grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"round_robin"}`))
+
+	// Add TLS or insecure option
 	if tlsopt := tls.GetDialOpt(); tlsopt != nil {
 		dialopts = append(dialopts, tlsopt)
 	} else {
 		dialopts = append(dialopts, grpc.WithInsecure())
 	}
 
-	for _, opt := range opts {
-		o, err := opt(target)
-		if err != nil {
-			return nil, err
-		}
-		dialopts = append(dialopts, o)
-	}
-
+	// Register Consul resolver
 	resolver.Register(&consulResolverBuilder{
-		client: getConsulClient(),
+		client: getConsulClient(consulAddr),
 	})
 
+	// Establish connection
 	conn, err := grpc.Dial(fmt.Sprintf("consul:///%s", target), dialopts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to service %s: %v", target, err)
 	}
 
+	fmt.Printf("Successfully connected to target [%s] via Consul address [%s]\n", target, consulAddr)
 	return conn, nil
 }
 
-// getConsulClient initializes a new Consul client.
-func getConsulClient() *api.Client {
-	client, err := api.NewClient(api.DefaultConfig())
+func getConsulClient(addr string) *api.Client {
+	cfg := api.DefaultConfig()
+	cfg.Address = addr
+
+	client, err := api.NewClient(cfg)
 	if err != nil {
-		panic(fmt.Sprintf("failed to create Consul client: %v", err))
+		panic(fmt.Sprintf("failed to create Consul client: %v at address %s", err, addr))
 	}
+	// fmt.Printf("Created Consul client for address [%s]\n", addr)
 	return client
 }

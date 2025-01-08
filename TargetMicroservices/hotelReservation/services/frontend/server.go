@@ -19,8 +19,6 @@ import (
 	search "github.com/harlow/go-micro-services/services/search/proto"
 	"github.com/harlow/go-micro-services/tls"
 	httptrace "gopkg.in/DataDog/dd-trace-go.v1/contrib/net/http"
-	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
-	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 )
 
 // Server implements frontend service
@@ -140,36 +138,34 @@ func (s *Server) getGrpcConn(name string) (*grpc.ClientConn, error) {
 	if s.KnativeDns != "" {
 		target := fmt.Sprintf("%s.%s", name, s.KnativeDns)
 		log.Info().Msgf("Dialing Knative DNS target: %s", target)
-		return dialer.Dial(target)
+		return dialer.Dial(target, dialer.WithTracer())
 	}
 
 	// Default to Consul-based service discovery
 	target := fmt.Sprintf("consul:///%s", name)
-	log.Info().Msgf("Dialing Consul target: %s", target)
-	return dialer.Dial(target)
+	log.Info().Msgf("Dialing Consul target: %s at %s for %s", target, s.Registry.Address(), name)
+	return dialer.Dial(target, dialer.WithTracer())
 }
 
+// DEBUG
 func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	ctx := r.Context()
 
-	// Start a new Datadog span
-	span, ctx := tracer.StartSpanFromContext(ctx, "frontend.searchHandler", tracer.ServiceName("frontend"))
-	defer span.Finish()
-
-	log.Trace().Msg("starts searchHandler")
+	log.Trace().Msg("searchHandler invoked")
 
 	// in/out dates from query params
 	inDate, outDate := r.URL.Query().Get("inDate"), r.URL.Query().Get("outDate")
 	if inDate == "" || outDate == "" {
+		log.Debug().Msg("inDate or outDate parameter is missing")
 		http.Error(w, "Please specify inDate/outDate params", http.StatusBadRequest)
-		span.SetTag(ext.Error, true)
 		return
 	}
 
-	// lan/lon from query params
+	// lat/lon from query params
 	sLat, sLon := r.URL.Query().Get("lat"), r.URL.Query().Get("lon")
 	if sLat == "" || sLon == "" {
+		log.Debug().Msg("lat or lon parameter is missing")
 		http.Error(w, "Please specify location params", http.StatusBadRequest)
 		return
 	}
@@ -179,9 +175,8 @@ func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 	Lon, _ := strconv.ParseFloat(sLon, 32)
 	lon := float32(Lon)
 
-	log.Trace().Msg("starts searchHandler querying downstream")
+	log.Debug().Msgf("Parsed request parameters: lat=%v, lon=%v, inDate=%s, outDate=%s", lat, lon, inDate, outDate)
 
-	log.Trace().Msgf("SEARCH [lat: %v, lon: %v, inDate: %v, outDate: %v", lat, lon, inDate, outDate)
 	// search for best hotels
 	searchResp, err := s.searchClient.Nearby(ctx, &search.NearbyRequest{
 		Lat:     lat,
@@ -190,14 +185,12 @@ func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 		OutDate: outDate,
 	})
 	if err != nil {
+		log.Error().Err(err).Msg("Error fetching search results")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	log.Trace().Msg("SearchHandler gets searchResp")
-	//for _, hid := range searchResp.HotelIds {
-	//	log.Trace().Msgf("Search Handler hotelId = %s", hid)
-	//}
+	log.Debug().Msgf("Received search response with hotel IDs: %v", searchResp.HotelIds)
 
 	// grab locale from query params or default to en
 	locale := r.URL.Query().Get("locale")
@@ -205,44 +198,48 @@ func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 		locale = "en"
 	}
 
+	// check availability
 	reservationResp, err := s.reservationClient.CheckAvailability(ctx, &reservation.Request{
-		CustomerName: "",
-		HotelId:      searchResp.HotelIds,
-		InDate:       inDate,
-		OutDate:      outDate,
-		RoomNumber:   1,
+		HotelId:    searchResp.HotelIds,
+		InDate:     inDate,
+		OutDate:    outDate,
+		RoomNumber: 1,
 	})
 	if err != nil {
-		log.Error().Msg("SearchHandler CheckAvailability failed")
+		log.Error().Err(err).Msg("Error checking availability")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	log.Trace().Msgf("searchHandler gets reserveResp")
-	log.Trace().Msgf("searchHandler gets reserveResp.HotelId = %s", reservationResp.HotelId)
+	log.Debug().Msgf("Availability response received for hotel IDs: %v", reservationResp.HotelId)
 
-	// hotel profiles
+	// fetch hotel profiles
 	profileResp, err := s.profileClient.GetProfiles(ctx, &profile.Request{
 		HotelIds: reservationResp.HotelId,
 		Locale:   locale,
 	})
 	if err != nil {
-		log.Error().Msg("SearchHandler GetProfiles failed")
+		log.Error().Err(err).Msg("Error fetching hotel profiles")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	log.Trace().Msg("searchHandler gets profileResp")
+	log.Debug().Msgf("Profile response received with hotels: %+v", profileResp.Hotels)
 
 	json.NewEncoder(w).Encode(geoJSONResponse(profileResp.Hotels))
+	log.Trace().Msg("searchHandler completed successfully")
 }
 
 func (s *Server) recommendHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	ctx := r.Context()
 
+	log.Trace().Msg("recommendHandler invoked")
+
+	// Parse latitude and longitude
 	sLat, sLon := r.URL.Query().Get("lat"), r.URL.Query().Get("lon")
 	if sLat == "" || sLon == "" {
+		log.Debug().Msg("lat or lon parameter is missing")
 		http.Error(w, "Please specify location params", http.StatusBadRequest)
 		return
 	}
@@ -251,22 +248,29 @@ func (s *Server) recommendHandler(w http.ResponseWriter, r *http.Request) {
 	Lon, _ := strconv.ParseFloat(sLon, 64)
 	lon := float64(Lon)
 
+	// Parse 'require' parameter
 	require := r.URL.Query().Get("require")
 	if require != "dis" && require != "rate" && require != "price" {
+		log.Debug().Msg("Invalid or missing 'require' parameter")
 		http.Error(w, "Please specify require params", http.StatusBadRequest)
 		return
 	}
 
-	// recommend hotels
+	log.Debug().Msgf("Parsed request parameters: lat=%v, lon=%v, require=%s", lat, lon, require)
+
+	// fetch recommendations
 	recResp, err := s.recommendationClient.GetRecommendations(ctx, &recommendation.Request{
 		Require: require,
-		Lat:     float64(lat),
-		Lon:     float64(lon),
+		Lat:     lat,
+		Lon:     lon,
 	})
 	if err != nil {
+		log.Error().Err(err).Msg("Error fetching recommendations")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	log.Debug().Msgf("Received recommendations with hotel IDs: %v", recResp.HotelIds)
 
 	// grab locale from query params or default to en
 	locale := r.URL.Query().Get("locale")
@@ -274,18 +278,162 @@ func (s *Server) recommendHandler(w http.ResponseWriter, r *http.Request) {
 		locale = "en"
 	}
 
-	// hotel profiles
+	// fetch hotel profiles
 	profileResp, err := s.profileClient.GetProfiles(ctx, &profile.Request{
 		HotelIds: recResp.HotelIds,
 		Locale:   locale,
 	})
 	if err != nil {
+		log.Error().Err(err).Msg("Error fetching hotel profiles")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
+	log.Debug().Msgf("Profile response received with hotels: %+v", profileResp.Hotels)
+
 	json.NewEncoder(w).Encode(geoJSONResponse(profileResp.Hotels))
+	log.Trace().Msg("recommendHandler completed successfully")
 }
+
+// DEBUG
+
+// func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
+// 	w.Header().Set("Access-Control-Allow-Origin", "*")
+// 	ctx := r.Context()
+
+// 	// Start a new Datadog span
+// 	span, ctx := tracer.StartSpanFromContext(ctx, "frontend.searchHandler", tracer.ServiceName("frontend"))
+// 	defer span.Finish()
+
+// 	log.Trace().Msg("starts searchHandler")
+
+// 	// in/out dates from query params
+// 	inDate, outDate := r.URL.Query().Get("inDate"), r.URL.Query().Get("outDate")
+// 	if inDate == "" || outDate == "" {
+// 		http.Error(w, "Please specify inDate/outDate params", http.StatusBadRequest)
+// 		span.SetTag(ext.Error, true)
+// 		return
+// 	}
+
+// 	// lan/lon from query params
+// 	sLat, sLon := r.URL.Query().Get("lat"), r.URL.Query().Get("lon")
+// 	if sLat == "" || sLon == "" {
+// 		http.Error(w, "Please specify location params", http.StatusBadRequest)
+// 		return
+// 	}
+
+// 	Lat, _ := strconv.ParseFloat(sLat, 32)
+// 	lat := float32(Lat)
+// 	Lon, _ := strconv.ParseFloat(sLon, 32)
+// 	lon := float32(Lon)
+
+// 	log.Trace().Msg("starts searchHandler querying downstream")
+
+// 	log.Trace().Msgf("SEARCH [lat: %v, lon: %v, inDate: %v, outDate: %v", lat, lon, inDate, outDate)
+// 	// search for best hotels
+// 	searchResp, err := s.searchClient.Nearby(ctx, &search.NearbyRequest{
+// 		Lat:     lat,
+// 		Lon:     lon,
+// 		InDate:  inDate,
+// 		OutDate: outDate,
+// 	})
+// 	if err != nil {
+// 		http.Error(w, err.Error(), http.StatusInternalServerError)
+// 		return
+// 	}
+
+// 	log.Trace().Msg("SearchHandler gets searchResp")
+// 	//for _, hid := range searchResp.HotelIds {
+// 	//	log.Trace().Msgf("Search Handler hotelId = %s", hid)
+// 	//}
+
+// 	// grab locale from query params or default to en
+// 	locale := r.URL.Query().Get("locale")
+// 	if locale == "" {
+// 		locale = "en"
+// 	}
+
+// 	reservationResp, err := s.reservationClient.CheckAvailability(ctx, &reservation.Request{
+// 		CustomerName: "",
+// 		HotelId:      searchResp.HotelIds,
+// 		InDate:       inDate,
+// 		OutDate:      outDate,
+// 		RoomNumber:   1,
+// 	})
+// 	if err != nil {
+// 		log.Error().Msg("SearchHandler CheckAvailability failed")
+// 		http.Error(w, err.Error(), http.StatusInternalServerError)
+// 		return
+// 	}
+
+// 	log.Trace().Msgf("searchHandler gets reserveResp")
+// 	log.Trace().Msgf("searchHandler gets reserveResp.HotelId = %s", reservationResp.HotelId)
+
+// 	// hotel profiles
+// 	profileResp, err := s.profileClient.GetProfiles(ctx, &profile.Request{
+// 		HotelIds: reservationResp.HotelId,
+// 		Locale:   locale,
+// 	})
+// 	if err != nil {
+// 		log.Error().Msg("SearchHandler GetProfiles failed")
+// 		http.Error(w, err.Error(), http.StatusInternalServerError)
+// 		return
+// 	}
+
+// 	log.Trace().Msg("searchHandler gets profileResp")
+
+// 	json.NewEncoder(w).Encode(geoJSONResponse(profileResp.Hotels))
+// }
+
+// func (s *Server) recommendHandler(w http.ResponseWriter, r *http.Request) {
+// 	w.Header().Set("Access-Control-Allow-Origin", "*")
+// 	ctx := r.Context()
+
+// 	sLat, sLon := r.URL.Query().Get("lat"), r.URL.Query().Get("lon")
+// 	if sLat == "" || sLon == "" {
+// 		http.Error(w, "Please specify location params", http.StatusBadRequest)
+// 		return
+// 	}
+// 	Lat, _ := strconv.ParseFloat(sLat, 64)
+// 	lat := float64(Lat)
+// 	Lon, _ := strconv.ParseFloat(sLon, 64)
+// 	lon := float64(Lon)
+
+// 	require := r.URL.Query().Get("require")
+// 	if require != "dis" && require != "rate" && require != "price" {
+// 		http.Error(w, "Please specify require params", http.StatusBadRequest)
+// 		return
+// 	}
+
+// 	// recommend hotels
+// 	recResp, err := s.recommendationClient.GetRecommendations(ctx, &recommendation.Request{
+// 		Require: require,
+// 		Lat:     float64(lat),
+// 		Lon:     float64(lon),
+// 	})
+// 	if err != nil {
+// 		http.Error(w, err.Error(), http.StatusInternalServerError)
+// 		return
+// 	}
+
+// 	// grab locale from query params or default to en
+// 	locale := r.URL.Query().Get("locale")
+// 	if locale == "" {
+// 		locale = "en"
+// 	}
+
+// 	// hotel profiles
+// 	profileResp, err := s.profileClient.GetProfiles(ctx, &profile.Request{
+// 		HotelIds: recResp.HotelIds,
+// 		Locale:   locale,
+// 	})
+// 	if err != nil {
+// 		http.Error(w, err.Error(), http.StatusInternalServerError)
+// 		return
+// 	}
+
+// 	json.NewEncoder(w).Encode(geoJSONResponse(profileResp.Hotels))
+// }
 
 func (s *Server) userHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")

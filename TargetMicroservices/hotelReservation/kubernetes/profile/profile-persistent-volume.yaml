@@ -8,7 +8,7 @@ spec:
     - ReadWriteOnce
   capacity:
     storage: 1Gi
-  storageClassName: profile-storage
+  storageClassName: gp2
   hostPath:
     path: /data/volumes/profile-pv   # Where all the hard drives are mounted
     type: DirectoryOrCreate

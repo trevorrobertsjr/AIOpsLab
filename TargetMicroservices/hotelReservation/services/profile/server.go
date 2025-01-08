@@ -106,7 +106,12 @@ func (s *Server) Run() error {
 		log.Fatal().Msgf("Failed to configure listener: %v", err)
 	}
 
-	err = s.Registry.Register(name, s.uuid, s.IpAddr, s.Port)
+	// Construct service DNS address without the prefix
+	namespace := "test-hotel-reservation"                                     // Replace with your namespace
+	serviceDNS := fmt.Sprintf("%s.%s.svc.cluster.local", name[4:], namespace) // Strip "srv-" from `name`
+
+	log.Info().Msgf("Registering service [name: %s, id: %s, address: %s, port: %d]", name, s.uuid, serviceDNS, s.Port)
+	err = s.Registry.Register(name, s.uuid, serviceDNS, s.Port)
 	if err != nil {
 		return fmt.Errorf("failed to register: %v", err)
 	}

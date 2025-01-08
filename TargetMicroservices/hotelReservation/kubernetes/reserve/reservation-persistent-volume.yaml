@@ -8,7 +8,7 @@ spec:
     - ReadWriteOnce
   capacity:
     storage: 1Gi
-  storageClassName: reservation-storage
+  storageClassName: gp2
   hostPath:
     path: /data/volumes/reservation-pv   # Where all the hard drives are mounted
     type: DirectoryOrCreate
