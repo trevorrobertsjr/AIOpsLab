@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"io"
@@ -19,21 +20,22 @@ import (
 
 func main() {
 	tune.Init()
+	// Create root context
+	ctx := context.Background()
+
 	// Configure tracing
 	tracer.Start(
-		tracer.WithEnv("staging"),
+		tracer.WithEnv("aiopslab"),
 		tracer.WithService("profile"),
 		tracer.WithServiceVersion("1.0"),
 	)
-	// When the tracer is stopped, it will flush everything it has to the Datadog Agent before quitting.
-	// Make sure this line stays in your main function.
 	defer tracer.Stop()
 
 	// Configure logger
 	datadogWriter := &datadogwriter.DatadogWriter{
 		Service:  "profile",
 		Hostname: "localhost",
-		Tags:     "env:staging,version:1.0",
+		Tags:     "env:aiopslab,version:1.0",
 		Source:   "profile-service",
 	}
 	log.Logger = zerolog.New(io.MultiWriter(os.Stdout, datadogWriter)).With().Timestamp().Logger()
@@ -43,22 +45,20 @@ func main() {
 	if err != nil {
 		log.Error().Msgf("Got error while reading config: %v", err)
 	}
-
 	defer jsonFile.Close()
 
 	byteValue, _ := ioutil.ReadAll(jsonFile)
-
 	var result map[string]string
 	json.Unmarshal([]byte(byteValue), &result)
 
 	log.Info().Msgf("Read database URL: %v", result["ProfileMongoAddress"])
 	log.Info().Msg("Initializing DB connection...")
-	mongo_session := initializeDatabase(result["ProfileMongoAddress"])
+	mongo_session := initializeDatabase(ctx, result["ProfileMongoAddress"])
 	defer mongo_session.Close()
 	log.Info().Msg("Successfull")
 
 	log.Info().Msgf("Read profile memcashed address: %v", result["ProfileMemcAddress"])
-	log.Info().Msg("Initializing Memcashed client...")
+	log.Info().Msg("Initializing Memcached client...")
 	memc_client := tune.NewMemCClient2(result["ProfileMemcAddress"])
 	log.Info().Msg("Successfull")
 
@@ -66,21 +66,9 @@ func main() {
 	serv_ip := result["ProfileIP"]
 	log.Info().Msgf("Read target port: %v", serv_port)
 	log.Info().Msgf("Read consul address: %v", result["consulAddress"])
-	// log.Info().Msgf("Read jaeger address: %v", result["jaegerAddress"])
 
-	var (
-		// port       = flag.Int("port", 8081, "The server port")
-		// jaegeraddr = flag.String("jaegeraddr", result["jaegerAddress"], "Jaeger server addr")
-		consuladdr = flag.String("consuladdr", result["consulAddress"], "Consul address")
-	)
+	var consuladdr = flag.String("consuladdr", result["consulAddress"], "Consul address")
 	flag.Parse()
-
-	// log.Info().Msgf("Initializing jaeger agent [service name: %v | host: %v]...", "profile", *jaegeraddr)
-	// tracer, err := tracing.Init("profile", *jaegeraddr)
-	// if err != nil {
-	// 	log.Panic().Msgf("Got error while initializing jaeger agent: %v", err)
-	// }
-	// log.Info().Msg("Jaeger agent initialized")
 
 	log.Info().Msgf("Initializing consul agent [host: %v]...", *consuladdr)
 	registry, err := registry.NewClient(*consuladdr)
@@ -90,8 +78,6 @@ func main() {
 	log.Info().Msg("Consul agent initialized")
 
 	srv := profile.Server{
-		// Tracer: tracer,
-		// Port:     *port,
 		Registry:     registry,
 		Port:         serv_port,
 		IpAddr:       serv_ip,
@@ -99,6 +85,14 @@ func main() {
 		MemcClient:   memc_client,
 	}
 
+	// // Trace server run
+	// serverRunSpan, ctx := tracer.StartSpanFromContext(ctx, "profile.server.Run", tracer.ResourceName("ProfileServer"))
+	// defer serverRunSpan.Finish()
+
 	log.Info().Msg("Starting server...")
-	log.Fatal().Msg(srv.Run().Error())
+	if err := srv.Run(); err != nil {
+		// serverRunSpan.SetTag(ext.Error, true)
+		// serverRunSpan.SetTag("error.message", err.Error())
+		log.Fatal().Msg(err.Error())
+	}
 }

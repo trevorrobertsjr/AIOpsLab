@@ -1,6 +1,7 @@
 package user
 
 import (
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"net"
@@ -11,10 +12,10 @@ import (
 	pb "github.com/harlow/go-micro-services/services/user/proto"
 	"github.com/harlow/go-micro-services/tls"
 	"github.com/rs/zerolog/log"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/stats"
+	ddgrpc "gopkg.in/DataDog/dd-trace-go.v1/contrib/google.golang.org/grpc"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 	"gopkg.in/mgo.v2"
@@ -61,6 +62,60 @@ func (t *tracerStatsHandler) TagConn(ctx context.Context, _ *stats.ConnTagInfo) 
 
 func (t *tracerStatsHandler) HandleConn(context.Context, stats.ConnStats) {}
 
+func UnaryServerInterceptor() grpc.UnaryServerInterceptor {
+	return func(
+		ctx context.Context,
+		req interface{},
+		info *grpc.UnaryServerInfo,
+		handler grpc.UnaryHandler,
+	) (interface{}, error) {
+		span, ctx := tracer.StartSpanFromContext(ctx, info.FullMethod, tracer.ResourceName(info.FullMethod))
+		defer span.Finish()
+
+		resp, err := handler(ctx, req)
+		if err != nil {
+			span.SetTag(ext.Error, true)
+			span.SetTag("error.message", err.Error())
+		}
+
+		return resp, err
+	}
+}
+
+func StreamServerInterceptor() grpc.StreamServerInterceptor {
+	return func(
+		srv interface{},
+		ss grpc.ServerStream,
+		info *grpc.StreamServerInfo,
+		handler grpc.StreamHandler,
+	) error {
+		span, ctx := tracer.StartSpanFromContext(ss.Context(), info.FullMethod, tracer.ResourceName(info.FullMethod))
+		defer span.Finish()
+
+		wrappedStream := &serverStreamWrapper{
+			ServerStream: ss,
+			ctx:          ctx,
+		}
+
+		err := handler(srv, wrappedStream)
+		if err != nil {
+			span.SetTag(ext.Error, true)
+			span.SetTag("error.message", err.Error())
+		}
+
+		return err
+	}
+}
+
+type serverStreamWrapper struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (w *serverStreamWrapper) Context() context.Context {
+	return w.ctx
+}
+
 // Server implements the user service
 type Server struct {
 	users        map[string]string
@@ -77,11 +132,21 @@ func (s *Server) Run() error {
 		return fmt.Errorf("server port must be set")
 	}
 
-	if s.users == nil {
-		s.users = loadUsers(s.MongoSession)
-	}
+	s.users = loadUsers(s.MongoSession)
 
 	s.uuid = uuid.New().String()
+
+	// opts := []grpc.ServerOption{
+	// 	grpc.KeepaliveParams(keepalive.ServerParameters{
+	// 		Timeout: 120 * time.Second,
+	// 	}),
+	// 	grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+	// 		PermitWithoutStream: true,
+	// 	}),
+	// 	grpc.StatsHandler(&tracerStatsHandler{}),          // Datadog tracing
+	// 	grpc.UnaryInterceptor(UnaryServerInterceptor()),   // Add unary interceptor
+	// 	grpc.StreamInterceptor(StreamServerInterceptor()), // Add stream interceptor
+	// }
 
 	opts := []grpc.ServerOption{
 		grpc.KeepaliveParams(keepalive.ServerParameters{
@@ -90,7 +155,8 @@ func (s *Server) Run() error {
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			PermitWithoutStream: true,
 		}),
-		grpc.StatsHandler(&tracerStatsHandler{}), // Datadog tracing
+		grpc.UnaryInterceptor(ddgrpc.UnaryServerInterceptor()),   // Datadog unary interceptor
+		grpc.StreamInterceptor(ddgrpc.StreamServerInterceptor()), // Datadog stream interceptor
 	}
 
 	if tlsopt := tls.GetServerOpt(); tlsopt != nil {
@@ -105,19 +171,6 @@ func (s *Server) Run() error {
 	if err != nil {
 		log.Fatal().Msgf("Failed to listen: %v", err)
 	}
-
-	// // register the service
-	// jsonFile, err := os.Open("config.json")
-	// if err != nil {
-	// 	fmt.Println(err)
-	// }
-
-	// defer jsonFile.Close()
-
-	// byteValue, _ := ioutil.ReadAll(jsonFile)
-
-	// var result map[string]string
-	// json.Unmarshal([]byte(byteValue), &result)
 
 	// Construct service DNS address without the prefix
 	namespace := "test-hotel-reservation"                                     // Replace with your namespace
@@ -167,7 +220,14 @@ func (s *Server) CheckUser(ctx context.Context, req *pb.Request) (*pb.Result, er
 }
 
 // loadUsers loads hotel users from MongoDB.
+// *** Updated to accept context and add tracing ***
 func loadUsers(session *mgo.Session) map[string]string {
+	// span, ctx := tracer.StartSpanFromContext(ctx, "mongo.load_users", tracer.Tag(ext.SpanType, "db"))
+	// defer span.Finish()
+
+	// span.SetTag(ext.DBInstance, "user-db")
+	// span.SetTag(ext.DBStatement, "Fetch all users")
+
 	s := session.Copy()
 	defer s.Close()
 	c := s.DB("user-db").C("user")
@@ -175,6 +235,7 @@ func loadUsers(session *mgo.Session) map[string]string {
 	var users []User
 	err := c.Find(bson.M{}).All(&users)
 	if err != nil {
+		// span.SetTag(ext.Error, err)
 		log.Error().Msgf("Failed to get users data: %v", err)
 	}
 
@@ -183,11 +244,13 @@ func loadUsers(session *mgo.Session) map[string]string {
 		res[user.Username] = user.Password
 	}
 
+	// span.SetTag("users.loaded", len(res))
 	log.Trace().Msg("Done loading users")
 
 	return res
 }
 
+// User struct represents a user in the system.
 type User struct {
 	Username string `bson:"username"`
 	Password string `bson:"password"`

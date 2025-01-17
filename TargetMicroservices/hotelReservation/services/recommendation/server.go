@@ -1,6 +1,7 @@
 package recommendation
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"net"
@@ -12,9 +13,10 @@ import (
 	pb "github.com/harlow/go-micro-services/services/recommendation/proto"
 	"github.com/harlow/go-micro-services/tls"
 	"github.com/rs/zerolog/log"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/stats"
+	ddgrpc "gopkg.in/DataDog/dd-trace-go.v1/contrib/google.golang.org/grpc"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 	"gopkg.in/mgo.v2"
@@ -22,6 +24,96 @@ import (
 )
 
 const name = "srv-recommendation"
+
+// Define tracerStatsHandler for Datadog tracing.
+type tracerStatsHandler struct{}
+
+func (t *tracerStatsHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
+	span, ctx := tracer.StartSpanFromContext(ctx, info.FullMethodName, tracer.ResourceName("grpc"))
+	return tracer.ContextWithSpan(ctx, span)
+}
+
+func (t *tracerStatsHandler) HandleRPC(ctx context.Context, rpcStats stats.RPCStats) {
+	span, ok := tracer.SpanFromContext(ctx)
+	if !ok {
+		return
+	}
+
+	switch event := rpcStats.(type) {
+	case *stats.InPayload:
+		span.SetTag("event", "in_payload")
+		span.SetTag("bytes_received", event.Length)
+	case *stats.OutPayload:
+		span.SetTag("event", "out_payload")
+		span.SetTag("bytes_sent", event.Length)
+	case *stats.End:
+		if event.Error != nil {
+			span.SetTag(ext.Error, event.Error)
+		}
+	}
+
+	span.Finish()
+}
+
+func (t *tracerStatsHandler) TagConn(ctx context.Context, _ *stats.ConnTagInfo) context.Context {
+	return ctx
+}
+
+func (t *tracerStatsHandler) HandleConn(context.Context, stats.ConnStats) {}
+
+func UnaryServerInterceptor() grpc.UnaryServerInterceptor {
+	return func(
+		ctx context.Context,
+		req interface{},
+		info *grpc.UnaryServerInfo,
+		handler grpc.UnaryHandler,
+	) (interface{}, error) {
+		span, ctx := tracer.StartSpanFromContext(ctx, info.FullMethod, tracer.ResourceName(info.FullMethod))
+		defer span.Finish()
+
+		resp, err := handler(ctx, req)
+		if err != nil {
+			span.SetTag(ext.Error, true)
+			span.SetTag("error.message", err.Error())
+		}
+
+		return resp, err
+	}
+}
+
+func StreamServerInterceptor() grpc.StreamServerInterceptor {
+	return func(
+		srv interface{},
+		ss grpc.ServerStream,
+		info *grpc.StreamServerInfo,
+		handler grpc.StreamHandler,
+	) error {
+		span, ctx := tracer.StartSpanFromContext(ss.Context(), info.FullMethod, tracer.ResourceName(info.FullMethod))
+		defer span.Finish()
+
+		wrappedStream := &serverStreamWrapper{
+			ServerStream: ss,
+			ctx:          ctx,
+		}
+
+		err := handler(srv, wrappedStream)
+		if err != nil {
+			span.SetTag(ext.Error, true)
+			span.SetTag("error.message", err.Error())
+		}
+
+		return err
+	}
+}
+
+type serverStreamWrapper struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (w *serverStreamWrapper) Context() context.Context {
+	return w.ctx
+}
 
 // Server implements the recommendation service
 type Server struct {
@@ -39,11 +131,22 @@ func (s *Server) Run() error {
 		return fmt.Errorf("server port must be set")
 	}
 
-	if s.hotels == nil {
-		s.hotels = loadRecommendations(s.MongoSession)
-	}
+	// *** Updated: Add context propagation and tracing to loadRecommendations ***
+	s.hotels = loadRecommendations(s.MongoSession)
 
 	s.uuid = uuid.New().String()
+
+	// opts := []grpc.ServerOption{
+	// 	grpc.KeepaliveParams(keepalive.ServerParameters{
+	// 		Timeout: 120 * time.Second,
+	// 	}),
+	// 	grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+	// 		PermitWithoutStream: true,
+	// 	}),
+	// 	grpc.StatsHandler(&tracerStatsHandler{}),          // Datadog tracing
+	// 	grpc.UnaryInterceptor(UnaryServerInterceptor()),   // Add unary interceptor
+	// 	grpc.StreamInterceptor(StreamServerInterceptor()), // Add stream interceptor
+	// }
 
 	opts := []grpc.ServerOption{
 		grpc.KeepaliveParams(keepalive.ServerParameters{
@@ -52,6 +155,8 @@ func (s *Server) Run() error {
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			PermitWithoutStream: true,
 		}),
+		grpc.UnaryInterceptor(ddgrpc.UnaryServerInterceptor()),   // Datadog unary interceptor
+		grpc.StreamInterceptor(ddgrpc.StreamServerInterceptor()), // Datadog stream interceptor
 	}
 
 	if tlsopt := tls.GetServerOpt(); tlsopt != nil {
@@ -59,7 +164,6 @@ func (s *Server) Run() error {
 	}
 
 	srv := grpc.NewServer(opts...)
-
 	pb.RegisterRecommendationServer(srv, s)
 
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
@@ -87,9 +191,14 @@ func (s *Server) Shutdown() {
 }
 
 // GetRecommendations returns recommendations within a given requirement.
+// *** Updated to include context propagation and enhanced tracing ***
 func (s *Server) GetRecommendations(ctx context.Context, req *pb.Request) (*pb.Result, error) {
 	span, ctx := tracer.StartSpanFromContext(ctx, "recommendation.get_recommendations", tracer.ResourceName("GetRecommendations"))
 	defer span.Finish()
+
+	span.SetTag("request.require", req.Require)
+	span.SetTag("request.lat", req.Lat)
+	span.SetTag("request.lon", req.Lon)
 
 	res := new(pb.Result)
 	require := req.Require
@@ -138,11 +247,18 @@ func (s *Server) GetRecommendations(ctx context.Context, req *pb.Request) (*pb.R
 		span.SetTag(ext.Error, true)
 	}
 
+	span.SetTag("response.hotel_count", len(res.HotelIds))
 	return res, nil
 }
 
 // loadRecommendations loads hotel recommendations from MongoDB.
 func loadRecommendations(session *mgo.Session) map[string]Hotel {
+	// span, ctx := tracer.StartSpanFromContext(ctx, "mongo.load_recommendations", tracer.Tag(ext.SpanType, "db"))
+	// defer span.Finish()
+
+	// span.SetTag(ext.DBInstance, "recommendation-db")
+	// span.SetTag(ext.DBStatement, "Fetch all recommendations")
+
 	s := session.Copy()
 	defer s.Close()
 
@@ -151,6 +267,7 @@ func loadRecommendations(session *mgo.Session) map[string]Hotel {
 	var hotels []Hotel
 	err := c.Find(bson.M{}).All(&hotels)
 	if err != nil {
+		// span.SetTag(ext.Error, err)
 		log.Error().Msgf("Failed to get hotel data: %v", err)
 	}
 
@@ -159,6 +276,7 @@ func loadRecommendations(session *mgo.Session) map[string]Hotel {
 		profiles[hotel.HId] = hotel
 	}
 
+	// span.SetTag("hotels.loaded", len(profiles))
 	return profiles
 }
 

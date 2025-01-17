@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"io"
@@ -19,81 +20,91 @@ import (
 
 func main() {
 	tune.Init()
-	// initializeDatabase()
+
+	// Initialize root context
+	ctx := context.Background()
+
 	// Configure tracing
 	tracer.Start(
-		tracer.WithEnv("staging"),
+		tracer.WithEnv("aiopslab"),
 		tracer.WithService("user"),
 		tracer.WithServiceVersion("1.0"),
 	)
-	// When the tracer is stopped, it will flush everything it has to the Datadog Agent before quitting.
-	// Make sure this line stays in your main function.
+	// Ensure tracer flushes on exit
 	defer tracer.Stop()
 
 	// Configure logging
 	datadogWriter := &datadogwriter.DatadogWriter{
 		Service:  "user",
 		Hostname: "localhost",
-		Tags:     "env:staging,version:1.0",
+		Tags:     "env:aiopslab,version:1.0",
 		Source:   "user-service",
 	}
 	log.Logger = zerolog.New(io.MultiWriter(os.Stdout, datadogWriter)).With().Timestamp().Logger()
 
+	// // Start main span
+	// mainSpan, ctx := tracer.StartSpanFromContext(ctx, "user.main", tracer.ResourceName("Main"))
+	// defer mainSpan.Finish()
+
 	log.Info().Msg("Reading config...")
 	jsonFile, err := os.Open("config.json")
 	if err != nil {
-		log.Error().Msgf("Got error while reading config: %v", err)
+		// mainSpan.SetTag(ext.Error, true)
+		log.Panic().Msgf("Got error while reading config: %v", err)
 	}
-
 	defer jsonFile.Close()
 
 	byteValue, _ := ioutil.ReadAll(jsonFile)
 
 	var result map[string]string
-	json.Unmarshal([]byte(byteValue), &result)
+	if err := json.Unmarshal([]byte(byteValue), &result); err != nil {
+		// mainSpan.SetTag(ext.Error, true)
+		log.Panic().Msgf("Error parsing config: %v", err)
+	}
 
 	log.Info().Msgf("Read database URL: %v", result["UserMongoAddress"])
 	log.Info().Msg("Initializing DB connection...")
-	mongo_session := initializeDatabase(result["UserMongoAddress"])
-	defer mongo_session.Close()
-	log.Info().Msg("Successfull")
+	// dbSpan, ctx := tracer.StartSpanFromContext(ctx, "user.initializeDatabase", tracer.ResourceName("InitializeDatabase"))
+	mongoSession := initializeDatabase(ctx, result["UserMongoAddress"])
+	// dbSpan.Finish()
+	defer mongoSession.Close()
 
-	serv_port, _ := strconv.Atoi(result["UserPort"])
-	serv_ip := result["UserIP"]
-	log.Info().Msgf("Read target port: %v", serv_port)
+	log.Info().Msg("Database connection successful")
+
+	servPort, _ := strconv.Atoi(result["UserPort"])
+	servIP := result["UserIP"]
+
+	log.Info().Msgf("Read target port: %v", servPort)
 	log.Info().Msgf("Read consul address: %v", result["consulAddress"])
-	// log.Info().Msgf("Read jaeger address: %v", result["jaegerAddress"])
 
 	var (
-		// port       = flag.Int("port", 8086, "The server port")
-		// jaegeraddr = flag.String("jaegeraddr", result["jaegerAddress"], "Jaeger server addr")
-		consuladdr = flag.String("consuladdr", result["consulAddress"], "Consul address")
+		consulAddr = flag.String("consuladdr", result["consulAddress"], "Consul address")
 	)
 	flag.Parse()
 
-	// log.Info().Msgf("Initializing jaeger agent [service name: %v | host: %v]...", "user", *jaegeraddr)
-	// tracer, err := tracing.Init("user", *jaegeraddr)
-	//	if err != nil {
-	//		log.Panic().Msgf("Got error while initializing jaeger agent: %v", err)
-	//	}
-	//	log.Info().Msg("Jaeger agent initialized")
-
-	log.Info().Msgf("Initializing consul agent [host: %v]...", *consuladdr)
-	registry, err := registry.NewClient(*consuladdr)
+	log.Info().Msgf("Initializing consul agent [host: %v]...", *consulAddr)
+	// regSpan, ctx := tracer.StartSpanFromContext(ctx, "user.registry", tracer.ResourceName("RegistryClient"))
+	registryClient, err := registry.NewClient(*consulAddr)
+	// regSpan.Finish()
 	if err != nil {
+		// mainSpan.SetTag(ext.Error, true)
 		log.Panic().Msgf("Got error while initializing consul agent: %v", err)
 	}
 	log.Info().Msg("Consul agent initialized")
 
 	srv := &user.Server{
-		//		Tracer: tracer,
-		// Port:     *port,
-		Registry:     registry,
-		Port:         serv_port,
-		IpAddr:       serv_ip,
-		MongoSession: mongo_session,
+		Registry:     registryClient,
+		Port:         servPort,
+		IpAddr:       servIP,
+		MongoSession: mongoSession,
 	}
 
 	log.Info().Msg("Starting server...")
-	log.Fatal().Msg(srv.Run().Error())
+	// serverSpan, ctx := tracer.StartSpanFromContext(ctx, "user.server.Run", tracer.ResourceName("Run"))
+	if err := srv.Run(); err != nil {
+		// serverSpan.SetTag(ext.Error, true)
+		// serverSpan.SetTag("error.message", err.Error())
+		log.Fatal().Msg(err.Error())
+	}
+	// serverSpan.Finish()
 }

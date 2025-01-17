@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"strconv"
 
 	"github.com/rs/zerolog/log"
@@ -18,15 +19,12 @@ type point struct {
 	Plon float64 `bson:"lon"`
 }
 
-func initializeDatabase(url string) *mgo.Session {
+func initializeDatabase(ctx context.Context, url string) *mgo.Session {
 	adminUsername := "admin"
 	adminPassword := "admin"
 
 	// Add credentials to the MongoDB connection URL
 	url = "mongodb://" + adminUsername + ":" + adminPassword + "@" + url
-	// url = "mongodb://" + "@" + url
-
-	log.Info().Msg(url)
 
 	session, err := mgo.Dial(url)
 	if err != nil {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"io"
@@ -18,73 +19,73 @@ import (
 )
 
 func main() {
+	// Initialize configuration and tuning parameters
 	tune.Init()
+
 	// Configure tracing
 	tracer.Start(
-		tracer.WithEnv("staging"),
-		tracer.WithService("frontend"),
-		tracer.WithServiceVersion("1.0"),
+		tracer.WithEnv("aiopslab"),       // Environment tag
+		tracer.WithService("frontend"),   // Service name
+		tracer.WithServiceVersion("1.0"), // Service version
+		// tracer.WithGlobalTag("team", "platform"), // Custom global tags
 	)
-	// When the tracer is stopped, it will flush everything it has to the Datadog Agent before quitting.
-	// Make sure this line stays in your main function.
-	defer tracer.Stop()
+	defer tracer.Stop() // Ensure traces are flushed before the application exits
 
-	// Configure logger
+	// Configure logger with Datadog writer
 	datadogWriter := &datadogwriter.DatadogWriter{
 		Service:  "frontend",
 		Hostname: "localhost",
-		Tags:     "env:staging,version:1.0",
+		Tags:     "env:aiopslab,version:1.0",
 		Source:   "frontend-service",
 	}
 	log.Logger = zerolog.New(io.MultiWriter(os.Stdout, datadogWriter)).With().Timestamp().Logger()
 
-	log.Info().Msg("Reading config...")
+	// Read configuration
+	log.Info().Msg("Reading configuration...")
 	jsonFile, err := os.Open("config.json")
 	if err != nil {
-		log.Error().Msgf("Got error while reading config: %v", err)
+		log.Fatal().Err(err).Msg("Failed to read config file")
 	}
 	defer jsonFile.Close()
 
 	byteValue, _ := ioutil.ReadAll(jsonFile)
-
 	var result map[string]string
-	json.Unmarshal([]byte(byteValue), &result)
+	if err := json.Unmarshal(byteValue, &result); err != nil {
+		log.Fatal().Err(err).Msg("Failed to parse config file")
+	}
 
-	serv_port, _ := strconv.Atoi(result["FrontendPort"])
-	serv_ip := result["FrontendIP"]
-	knative_dns := result["KnativeDomainName"]
+	// Extract configurations
+	servPort, _ := strconv.Atoi(result["FrontendPort"])
+	servIP := result["FrontendIP"]
+	knativeDNS := result["KnativeDomainName"]
+	consulAddr := result["consulAddress"]
 
-	log.Info().Msgf("Read target port: %v", serv_port)
-	log.Info().Msgf("Read consul address: %v", result["consulAddress"])
-	// log.Info().Msgf("Read jaeger address: %v", result["jaegerAddress"])
-	var (
-		// port       = flag.Int("port", 5000, "The server port")
-		// jaegeraddr = flag.String("jaegeraddr", result["jaegerAddress"], "Jaeger address")
-		consuladdr = flag.String("consuladdr", result["consulAddress"], "Consul address")
-	)
+	log.Info().Msgf("Configuration: Port=%d, ConsulAddress=%s", servPort, consulAddr)
+
+	// Parse flags
 	flag.Parse()
-	// log.Info().Msgf("Initializing jaeger agent [service name: %v | host: %v]...", "frontend", *jaegeraddr)
-	// tracer, err := tracing.Init("frontend", *jaegeraddr)
-	// if err != nil {
-	// 	log.Panic().Msgf("Got error while initializing jaeger agent: %v", err)
-	// }
-	// log.Info().Msg("Jaeger agent initialized")
 
-	log.Info().Msgf("Initializing consul agent [host: %v]...", *consuladdr)
-	registry, err := registry.NewClient(*consuladdr)
+	// Initialize Consul registry
+	log.Info().Msgf("Initializing Consul agent at %s...", consulAddr)
+	registry, err := registry.NewClient(consulAddr)
 	if err != nil {
-		log.Panic().Msgf("Got error while initializing consul agent: %v", err)
+		log.Fatal().Err(err).Msg("Failed to initialize Consul agent")
 	}
-	log.Info().Msg("Consul agent initialized")
+	log.Info().Msg("Consul agent initialized successfully")
 
+	// Initialize the frontend server
 	srv := &frontend.Server{
-		KnativeDns: knative_dns,
+		KnativeDns: knativeDNS,
 		Registry:   registry,
-		// Tracer:     tracer,
-		IpAddr: serv_ip,
-		Port:   serv_port,
+		IpAddr:     servIP,
+		Port:       servPort,
 	}
 
-	log.Info().Msg("Starting server...")
-	log.Fatal().Msg(srv.Run().Error())
+	// Pass root context to enable trace propagation
+	rootCtx := context.Background()
+
+	log.Info().Msg("Starting frontend server...")
+	if err := srv.Run(rootCtx); err != nil {
+		log.Fatal().Err(err).Msg("Frontend server encountered an error")
+	}
 }

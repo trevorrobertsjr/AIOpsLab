@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,6 +16,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/stats"
+	ddgrpc "gopkg.in/DataDog/dd-trace-go.v1/contrib/google.golang.org/grpc"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 	"gopkg.in/mgo.v2"
@@ -56,9 +58,64 @@ func (t *tracerStatsHandler) TagConn(ctx context.Context, _ *stats.ConnTagInfo) 
 
 func (t *tracerStatsHandler) HandleConn(context.Context, stats.ConnStats) {}
 
+func UnaryServerInterceptor() grpc.UnaryServerInterceptor {
+	return func(
+		ctx context.Context,
+		req interface{},
+		info *grpc.UnaryServerInfo,
+		handler grpc.UnaryHandler,
+	) (interface{}, error) {
+		span, ctx := tracer.StartSpanFromContext(ctx, info.FullMethod, tracer.ResourceName(info.FullMethod))
+		defer span.Finish()
+
+		resp, err := handler(ctx, req)
+		if err != nil {
+			span.SetTag(ext.Error, true)
+			span.SetTag("error.message", err.Error())
+		}
+
+		return resp, err
+	}
+}
+
+func StreamServerInterceptor() grpc.StreamServerInterceptor {
+	return func(
+		srv interface{},
+		ss grpc.ServerStream,
+		info *grpc.StreamServerInfo,
+		handler grpc.StreamHandler,
+	) error {
+		span, ctx := tracer.StartSpanFromContext(ss.Context(), info.FullMethod, tracer.ResourceName(info.FullMethod))
+		defer span.Finish()
+
+		wrappedStream := &serverStreamWrapper{
+			ServerStream: ss,
+			ctx:          ctx,
+		}
+
+		err := handler(srv, wrappedStream)
+		if err != nil {
+			span.SetTag(ext.Error, true)
+			span.SetTag("error.message", err.Error())
+		}
+
+		return err
+	}
+}
+
+type serverStreamWrapper struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (w *serverStreamWrapper) Context() context.Context {
+	return w.ctx
+}
+
 // Server implements the geo service
 type Server struct {
 	index        *geoindex.ClusteringIndex
+	indexOnce    sync.Once // Added to ensure thread-safe initialization
 	uuid         string
 	Registry     *registry.Client
 	Port         int
@@ -72,11 +129,19 @@ func (s *Server) Run() error {
 		return fmt.Errorf("server port must be set")
 	}
 
-	if s.index == nil {
-		s.index = newGeoIndex(s.MongoSession)
-	}
-
 	s.uuid = uuid.New().String()
+
+	// opts := []grpc.ServerOption{
+	// 	grpc.KeepaliveParams(keepalive.ServerParameters{
+	// 		Timeout: 120 * time.Second,
+	// 	}),
+	// 	grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+	// 		PermitWithoutStream: true,
+	// 	}),
+	// 	grpc.StatsHandler(&tracerStatsHandler{}),          // Datadog tracing
+	// 	grpc.UnaryInterceptor(UnaryServerInterceptor()),   // Add unary interceptor
+	// 	grpc.StreamInterceptor(StreamServerInterceptor()), // Add stream interceptor
+	// }
 
 	opts := []grpc.ServerOption{
 		grpc.KeepaliveParams(keepalive.ServerParameters{
@@ -85,7 +150,8 @@ func (s *Server) Run() error {
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			PermitWithoutStream: true,
 		}),
-		grpc.StatsHandler(&tracerStatsHandler{}), // Datadog tracing
+		grpc.UnaryInterceptor(ddgrpc.UnaryServerInterceptor()),   // Datadog unary interceptor
+		grpc.StreamInterceptor(ddgrpc.StreamServerInterceptor()), // Datadog stream interceptor
 	}
 
 	if tlsopt := tls.GetServerOpt(); tlsopt != nil {
@@ -122,7 +188,19 @@ func (s *Server) Shutdown() {
 
 // Nearby returns all hotels within a given distance.
 func (s *Server) Nearby(ctx context.Context, req *pb.Request) (*pb.Result, error) {
+	span, ctx := tracer.StartSpanFromContext(ctx, "geo.Nearby")
+	defer span.Finish()
+
 	log.Trace().Msgf("In geo Nearby")
+
+	// Initialize the index if it has not been done already
+	s.indexOnce.Do(func() {
+		log.Info().Msg("Initializing geo index")
+		log.Info().Msg("Calling newGeoIndex")
+		s.index = s.newGeoIndex(ctx) // Use the incoming context for tracing
+		log.Info().Msg("newGeoIndex completed")
+
+	})
 
 	var (
 		points = s.getNearbyPoints(ctx, float64(req.Lat), float64(req.Lon))
@@ -140,6 +218,9 @@ func (s *Server) Nearby(ctx context.Context, req *pb.Request) (*pb.Result, error
 }
 
 func (s *Server) getNearbyPoints(ctx context.Context, lat, lon float64) []geoindex.Point {
+	span, ctx := tracer.StartSpanFromContext(ctx, "geo.getNearbyPoints")
+	defer span.Finish()
+
 	log.Trace().Msgf("In geo getNearbyPoints, lat = %f, lon = %f", lat, lon)
 
 	center := &geoindex.GeoPoint{
@@ -148,42 +229,65 @@ func (s *Server) getNearbyPoints(ctx context.Context, lat, lon float64) []geoind
 		Plon: lon,
 	}
 
-	return s.index.KNearest(
+	points := s.index.KNearest(
 		center,
 		maxSearchResults,
 		geoindex.Km(maxSearchRadius), func(p geoindex.Point) bool {
 			return true
 		},
 	)
+	span.SetTag("points.count", len(points))
+	return points
 }
 
-// newGeoIndex returns a geo index with points loaded
-func newGeoIndex(session *mgo.Session) *geoindex.ClusteringIndex {
+func (s *Server) newGeoIndex(ctx context.Context) *geoindex.ClusteringIndex {
+	span, ctx := tracer.StartSpanFromContext(ctx, "geo.newGeoIndex",
+		tracer.ResourceName("NewGeoIndex"),
+		tracer.Tag(ext.Component, "geo-service"), // Indicates the service component
+		tracer.Tag(ext.SpanKind, ext.SpanKindServer),
+	)
+	// Debug Optional: Add a small delay to simulate processing time and ensure the span is captured
+	// time.Sleep(100 * time.Millisecond)  // Adjust the duration as need
+	// span.SetTag("sampling.priority", 2) // Ensure the trace is kept
+	defer span.Finish()
+	log.Info().Msgf("geo.newGeoIndex span started with trace ID: %d", span.Context().TraceID())
+
 	log.Trace().Msg("new geo newGeoIndex")
 
-	s := session.Copy()
-	defer s.Close()
+	sess := s.MongoSession.Copy()
+	defer sess.Close()
 
 	// Start span for MongoDB query
-	mongoSpan := tracer.StartSpan("mongo.query", tracer.Tag(ext.DBType, "mongo"))
-	mongoSpan.SetTag(ext.DBInstance, "geo-db")
-	mongoSpan.SetTag(ext.DBStatement, "Fetching all geo points")
+	mongoSpan, ctx := tracer.StartSpanFromContext(ctx, "mongo.query",
+		tracer.Tag(ext.DBType, "mongo"),                          // Specifies the database type as MongoDB
+		tracer.Tag(ext.SpanType, "db"),                           // Classifies this as a MongoDB span
+		tracer.Tag(ext.DBInstance, "geo-db"),                     // Specifies the database name
+		tracer.Tag(ext.SpanKind, ext.SpanKindClient),             // Classifies the span as a client span
+		tracer.Tag(ext.DBStatement, "db.geo.find({})"),           // Describes the database operation
+		tracer.Tag(ext.ResourceName, "MongoDB: Find Geo Points"), // A human-readable name for the operation
+	)
 	defer mongoSpan.Finish()
 
-	c := s.DB("geo-db").C("geo")
+	c := sess.DB("geo-db").C("geo")
 
 	var points []*point
 	err := c.Find(bson.M{}).All(&points)
 	if err != nil {
-		log.Error().Msgf("Failed get geo data: %v", err)
-		mongoSpan.SetTag(ext.Error, err)
+		mongoSpan.SetTag(ext.Error, true)
+		mongoSpan.SetTag("error.message", fmt.Sprintf("Failed to get geo data: %v", err))
+		log.Error().Msgf("Failed to get geo data: %v", err)
 	}
+
+	// Add additional metadata after query execution
+	mongoSpan.SetTag("geo.points.loaded", len(points)) // Tag for the number of loaded points
 
 	index := geoindex.NewClusteringIndex()
 	for _, point := range points {
 		index.Add(point)
 	}
 
+	// Add final tag to parent span
+	span.SetTag("geo.points.indexed", len(points))
 	return index
 }
 

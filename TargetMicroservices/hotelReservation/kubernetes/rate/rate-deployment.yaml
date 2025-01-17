@@ -28,7 +28,7 @@ spec:
       containers:
         - command:
             - rate
-          image: trevorrobertsjr/aiopslab-hotelreservation-aio:latest
+          image: 961338350655.dkr.ecr.us-east-1.amazonaws.com/aiopslab-hotelreservation-aio:latest
           # securityContext:
           #   privileged: true
           name: hotel-reserv-rate
@@ -50,11 +50,15 @@ spec:
             - name: DD_SERVICE
               value: "rate"
             - name: DD_ENV
-              value: "staging"
+              value: "aiopslab"
             - name: DD_VERSION
               value: "1.0"
             - name: DD_TRACE_AGENT_URL
               value: "unix:///var/run/datadog/apm.socket"
+            - name: DD_TRACE_SAMPLING_RULES
+              value: '[{"sample_rate":1.0}]' # Captures all traces
+            - name: DD_TRACE_RATE_LIMIT
+              value: "100" # Allows up to 100 traces per second
           volumeMounts:
             - mountPath: /var/run/datadog
               name: "apmsocketpath"

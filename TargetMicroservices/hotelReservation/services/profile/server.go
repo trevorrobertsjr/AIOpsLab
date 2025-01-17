@@ -1,6 +1,7 @@
 package profile
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -13,10 +14,10 @@ import (
 	pb "github.com/harlow/go-micro-services/services/profile/proto"
 	"github.com/harlow/go-micro-services/tls"
 	"github.com/rs/zerolog/log"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/stats"
+	ddgrpc "gopkg.in/DataDog/dd-trace-go.v1/contrib/google.golang.org/grpc"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 	"gopkg.in/mgo.v2"
@@ -39,7 +40,6 @@ func (t *tracerStatsHandler) HandleRPC(ctx context.Context, rpcStats stats.RPCSt
 		return
 	}
 
-	// Handle specific RPC stats events
 	switch statsEvent := rpcStats.(type) {
 	case *stats.InPayload:
 		span.SetTag("event", "in_payload")
@@ -64,6 +64,60 @@ func (t *tracerStatsHandler) TagConn(ctx context.Context, _ *stats.ConnTagInfo) 
 
 func (t *tracerStatsHandler) HandleConn(context.Context, stats.ConnStats) {}
 
+func UnaryServerInterceptor() grpc.UnaryServerInterceptor {
+	return func(
+		ctx context.Context,
+		req interface{},
+		info *grpc.UnaryServerInfo,
+		handler grpc.UnaryHandler,
+	) (interface{}, error) {
+		span, ctx := tracer.StartSpanFromContext(ctx, info.FullMethod, tracer.ResourceName(info.FullMethod))
+		defer span.Finish()
+
+		resp, err := handler(ctx, req)
+		if err != nil {
+			span.SetTag(ext.Error, true)
+			span.SetTag("error.message", err.Error())
+		}
+
+		return resp, err
+	}
+}
+
+func StreamServerInterceptor() grpc.StreamServerInterceptor {
+	return func(
+		srv interface{},
+		ss grpc.ServerStream,
+		info *grpc.StreamServerInfo,
+		handler grpc.StreamHandler,
+	) error {
+		span, ctx := tracer.StartSpanFromContext(ss.Context(), info.FullMethod, tracer.ResourceName(info.FullMethod))
+		defer span.Finish()
+
+		wrappedStream := &serverStreamWrapper{
+			ServerStream: ss,
+			ctx:          ctx,
+		}
+
+		err := handler(srv, wrappedStream)
+		if err != nil {
+			span.SetTag(ext.Error, true)
+			span.SetTag("error.message", err.Error())
+		}
+
+		return err
+	}
+}
+
+type serverStreamWrapper struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (w *serverStreamWrapper) Context() context.Context {
+	return w.ctx
+}
+
 // Server implements the profile service
 type Server struct {
 	uuid         string
@@ -84,6 +138,18 @@ func (s *Server) Run() error {
 
 	log.Trace().Msgf("Starting profile service at %s:%d", s.IpAddr, s.Port)
 
+	// opts := []grpc.ServerOption{
+	// 	grpc.KeepaliveParams(keepalive.ServerParameters{
+	// 		Timeout: 120 * time.Second,
+	// 	}),
+	// 	grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+	// 		PermitWithoutStream: true,
+	// 	}),
+	// 	grpc.StatsHandler(&tracerStatsHandler{}),          // Datadog tracing
+	// 	grpc.UnaryInterceptor(UnaryServerInterceptor()),   // Add unary interceptor
+	// 	grpc.StreamInterceptor(StreamServerInterceptor()), // Add stream interceptor
+	// }
+
 	opts := []grpc.ServerOption{
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			Timeout: 120 * time.Second,
@@ -91,7 +157,8 @@ func (s *Server) Run() error {
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			PermitWithoutStream: true,
 		}),
-		grpc.StatsHandler(&tracerStatsHandler{}), // Datadog tracing
+		grpc.UnaryInterceptor(ddgrpc.UnaryServerInterceptor()),   // Datadog unary interceptor
+		grpc.StreamInterceptor(ddgrpc.StreamServerInterceptor()), // Datadog stream interceptor
 	}
 
 	if tlsopt := tls.GetServerOpt(); tlsopt != nil {
@@ -111,12 +178,16 @@ func (s *Server) Run() error {
 	serviceDNS := fmt.Sprintf("%s.%s.svc.cluster.local", name[4:], namespace) // Strip "srv-" from `name`
 
 	log.Info().Msgf("Registering service [name: %s, id: %s, address: %s, port: %d]", name, s.uuid, serviceDNS, s.Port)
+
+	// ** Add tracing span for service registration **
+	// regSpan, ctx := tracer.StartSpanFromContext(ctx, "service.registration")
 	err = s.Registry.Register(name, s.uuid, serviceDNS, s.Port)
+	// regSpan.Finish()
 	if err != nil {
 		return fmt.Errorf("failed to register: %v", err)
 	}
-	log.Info().Msg("Successfully registered in consul")
 
+	log.Info().Msg("Successfully registered in consul")
 	return srv.Serve(lis)
 }
 
@@ -127,6 +198,9 @@ func (s *Server) Shutdown() {
 
 // GetProfiles returns hotel profiles for requested IDs
 func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, error) {
+	span, ctx := tracer.StartSpanFromContext(ctx, "profile.GetProfiles")
+	defer span.Finish()
+
 	log.Trace().Msg("In GetProfiles")
 
 	res := new(pb.Result)
@@ -141,10 +215,14 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 		profileMap[hotelId] = struct{}{}
 	}
 
-	memSpan, _ := tracer.StartSpanFromContext(ctx, "memcached.get_profile", tracer.Tag(ext.SpanType, "cache"))
+	// *** Updated: Add timeout and tracing for Memcached operation ***
+	memCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	memSpan, memCtx := tracer.StartSpanFromContext(memCtx, "memcached.get_profile", tracer.Tag(ext.SpanType, "cache"))
 	memSpan.SetTag(ext.Component, "memcached")
 	memSpan.SetTag(ext.PeerService, "memcached-profile")
-	resMap, err := s.MemcClient.GetMulti(hotelIds)
+	resMap, err := s.MemcClient.GetMulti(hotelIds) // Memcached does not support context directly
 	memSpan.Finish()
 	if err != nil && err != memcache.ErrCacheMiss {
 		log.Panic().Msgf("Memcached error: %v", err)
@@ -161,18 +239,31 @@ func (s *Server) GetProfiles(ctx context.Context, req *pb.Request) (*pb.Result, 
 	for hotelId := range profileMap {
 		go func(hotelId string) {
 			defer wg.Done()
+
+			// *** Updated: Add timeout and tracing for MongoDB operation ***
+			mongoCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+
 			session := s.MongoSession.Copy()
 			defer session.Close()
 			c := session.DB("profile-db").C("hotels")
 
 			hotelProf := new(pb.Hotel)
-			mongoSpan, _ := tracer.StartSpanFromContext(ctx, "mongo.query", tracer.Tag(ext.SpanType, "db"))
-			mongoSpan.SetTag(ext.DBInstance, "profile-db")
-			mongoSpan.SetTag(ext.DBStatement, fmt.Sprintf("Find hotel by ID: %s", hotelId))
+			mongoSpan, mongoCtx := tracer.StartSpanFromContext(mongoCtx, "mongo.query",
+				tracer.Tag(ext.DBType, "mongo"),                                               // Specifies the database type as MongoDB
+				tracer.Tag(ext.SpanType, "db"),                                                // Classifies this as a MongoDB span
+				tracer.Tag(ext.DBInstance, "profile-db"),                                      // Specifies the database name
+				tracer.Tag(ext.SpanKind, ext.SpanKindClient),                                  // Classifies the span as a client span
+				tracer.Tag(ext.DBStatement, fmt.Sprintf("db.hotels.find({id: %q})", hotelId)), // Describes the database operation
+				tracer.Tag(ext.ResourceName, "MongoDB: Find Hotel By ID"),                     // Human-readable resource name
+			)
+			defer mongoSpan.Finish()
+
 			err := c.Find(bson.M{"id": hotelId}).One(&hotelProf)
-			mongoSpan.Finish()
 
 			if err != nil {
+				mongoSpan.SetTag(ext.Error, true)
+				mongoSpan.SetTag("error.message", fmt.Sprintf("Failed to fetch hotel data: %v", err))
 				log.Error().Msgf("Failed to get hotel data: %v", err)
 				return
 			}

@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/stats"
+	ddgrpc "gopkg.in/DataDog/dd-trace-go.v1/contrib/google.golang.org/grpc"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 )
@@ -47,8 +48,6 @@ type consulResolver struct {
 }
 
 func (r *consulResolver) watchAgent() {
-	// connected := false
-	// Normalize target by stripping the "consul:///" prefix
 	normalizedTarget := r.target
 	if len(normalizedTarget) > 10 && normalizedTarget[:10] == "consul:///" {
 		normalizedTarget = normalizedTarget[10:]
@@ -58,40 +57,26 @@ func (r *consulResolver) watchAgent() {
 		case <-r.stopCh:
 			return
 		default:
-
 			services, err := r.client.Agent().Services()
 			if err != nil {
 				fmt.Printf("[%s] Failed to resolve services for target %s: %v\n",
 					time.Now().Format("2006-01-02 15:04:05"), r.target, err)
-				// connected = false
 				time.Sleep(5 * time.Second)
 				continue
 			}
 
 			var addresses []resolver.Address
 			for _, service := range services {
-				// fmt.Printf("[%s] Trying %s == %s", time.Now().Format("2006-01-02 15:04:05"), service.Service, normalizedTarget)
 				if service.Service == normalizedTarget {
 					addresses = append(addresses, resolver.Address{
 						Addr: fmt.Sprintf("%s:%d", service.Address, service.Port),
 					})
-					lastItem := ""
-					if len(addresses) > 0 {
-						lastItem = addresses[len(addresses)-1].Addr
-						// fmt.Println("Last item:", lastItem)
-					}
+					lastItem := addresses[len(addresses)-1].Addr
 					fmt.Printf("Added service %s for target %s with address %s", service.Service, r.target, lastItem)
 				}
 			}
 
 			r.cc.UpdateState(resolver.State{Addresses: addresses})
-
-			// if !connected {
-			// 	fmt.Printf("[%s] Successfully connected to service: %s\n",
-			// 		time.Now().Format("2006-01-02 15:04:05"), r.target)
-			// 	connected = true
-			// }
-
 			time.Sleep(5 * time.Second)
 		}
 	}
@@ -101,14 +86,14 @@ func (r *consulResolver) ResolveNow(_ resolver.ResolveNowOptions) {}
 func (r *consulResolver) Close()                                  { close(r.stopCh) }
 
 // tracerStatsHandler implements gRPC stats.Handler for Datadog tracing.
-type tracerStatsHandler struct{}
+type TracerStatsHandler struct{}
 
-func (t *tracerStatsHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
+func (t *TracerStatsHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
 	span, ctx := tracer.StartSpanFromContext(ctx, info.FullMethodName, tracer.Tag(ext.SpanType, "rpc"))
 	return tracer.ContextWithSpan(ctx, span)
 }
 
-func (t *tracerStatsHandler) HandleRPC(ctx context.Context, rpcStats stats.RPCStats) {
+func (t *TracerStatsHandler) HandleRPC(ctx context.Context, rpcStats stats.RPCStats) {
 	span, ok := tracer.SpanFromContext(ctx)
 	if !ok {
 		return
@@ -126,32 +111,90 @@ func (t *tracerStatsHandler) HandleRPC(ctx context.Context, rpcStats stats.RPCSt
 	span.Finish()
 }
 
-func (t *tracerStatsHandler) TagConn(ctx context.Context, _ *stats.ConnTagInfo) context.Context {
+func (t *TracerStatsHandler) TagConn(ctx context.Context, _ *stats.ConnTagInfo) context.Context {
 	return ctx
 }
-func (t *tracerStatsHandler) HandleConn(context.Context, stats.ConnStats) {}
+func (t *TracerStatsHandler) HandleConn(context.Context, stats.ConnStats) {}
 
 // WithTracer enables Datadog tracing for gRPC calls.
 func WithTracer() DialOption {
 	return func(name string) (grpc.DialOption, error) {
-		return grpc.WithStatsHandler(&tracerStatsHandler{}), nil
+		return grpc.WithStatsHandler(&TracerStatsHandler{}), nil
+	}
+}
+
+// WithUnaryInterceptor enables the Datadog unary interceptor.
+func WithUnaryInterceptor() DialOption {
+	return func(name string) (grpc.DialOption, error) {
+		// Use the Datadog-provided interceptor
+		return grpc.WithUnaryInterceptor(ddgrpc.UnaryClientInterceptor(ddgrpc.WithServiceName(name))), nil
 	}
 }
 
 // DialOption allows optional configurations for gRPC Dial.
 type DialOption func(target string) (grpc.DialOption, error)
 
-func Dial(target string, opts ...DialOption) (*grpc.ClientConn, error) {
-	consulAddr := "consul.test-hotel-reservation.svc.cluster.local:8500" // Set DNS name directly
+// Dial establishes a gRPC connection with optional configurations.
+// func Dial(ctx context.Context, target string, customOpt grpc.DialOption, opts ...DialOption) (*grpc.ClientConn, error) {
+// 	consulAddr := "consul.test-hotel-reservation.svc.cluster.local:8500"
+// 	dialopts := []grpc.DialOption{}
+
+// 	// Process DialOptions
+// 	for _, opt := range opts {
+// 		dialOption, err := opt(target)
+// 		if err != nil {
+// 			return nil, fmt.Errorf("failed to process DialOption: %v", err)
+// 		}
+// 		dialopts = append(dialopts, dialOption)
+// 	}
+
+// 	// Include the custom option
+// 	if customOpt != nil {
+// 		dialopts = append(dialopts, customOpt)
+// 	}
+
+// 	fmt.Printf("Dialing Consul target [%s] at address [%s]\n", target, consulAddr)
+
+// 	// Add default gRPC options
+// 	dialopts = append(dialopts, grpc.WithKeepaliveParams(keepalive.ClientParameters{
+// 		Timeout:             120 * time.Second,
+// 		PermitWithoutStream: true,
+// 	}))
+// 	dialopts = append(dialopts, grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"round_robin"}`))
+
+// 	// Add TLS or insecure option
+// 	if tlsopt := tls.GetDialOpt(); tlsopt != nil {
+// 		dialopts = append(dialopts, tlsopt)
+// 	} else {
+// 		dialopts = append(dialopts, grpc.WithInsecure())
+// 	}
+
+// 	// Register Consul resolver
+// 	resolver.Register(&consulResolverBuilder{
+// 		client: getConsulClient(consulAddr),
+// 	})
+
+// 	// Use context when dialing
+// 	conn, err := grpc.DialContext(ctx, fmt.Sprintf("consul:///%s", target), dialopts...)
+// 	if err != nil {
+// 		return nil, fmt.Errorf("failed to connect to target %s: %v", target, err)
+// 	}
+
+// 	fmt.Printf("Successfully connected to target [%s] via Consul address [%s]\n", target, consulAddr)
+// 	return conn, nil
+// }
+
+func Dial(ctx context.Context, target string, opts ...DialOption) (*grpc.ClientConn, error) {
+	consulAddr := "consul.test-hotel-reservation.svc.cluster.local:8500"
 	dialopts := []grpc.DialOption{}
 
-	// Process DialOptions
+	// Process custom DialOptions and add them to the dial options
 	for _, opt := range opts {
-		dialOption, err := opt(target)
+		grpcOpt, err := opt(target)
 		if err != nil {
 			return nil, fmt.Errorf("failed to process DialOption: %v", err)
 		}
-		dialopts = append(dialopts, dialOption)
+		dialopts = append(dialopts, grpcOpt)
 	}
 
 	fmt.Printf("Dialing Consul target [%s] at address [%s]\n", target, consulAddr)
@@ -175,10 +218,10 @@ func Dial(target string, opts ...DialOption) (*grpc.ClientConn, error) {
 		client: getConsulClient(consulAddr),
 	})
 
-	// Establish connection
-	conn, err := grpc.Dial(fmt.Sprintf("consul:///%s", target), dialopts...)
+	// Use context when dialing
+	conn, err := grpc.DialContext(ctx, fmt.Sprintf("consul:///%s", target), dialopts...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to service %s: %v", target, err)
+		return nil, fmt.Errorf("failed to connect to target %s: %v", target, err)
 	}
 
 	fmt.Printf("Successfully connected to target [%s] via Consul address [%s]\n", target, consulAddr)
@@ -193,6 +236,5 @@ func getConsulClient(addr string) *api.Client {
 	if err != nil {
 		panic(fmt.Sprintf("failed to create Consul client: %v at address %s", err, addr))
 	}
-	// fmt.Printf("Created Consul client for address [%s]\n", addr)
 	return client
 }

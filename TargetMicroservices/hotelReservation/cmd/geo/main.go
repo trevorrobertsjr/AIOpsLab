@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"io"
@@ -19,81 +20,82 @@ import (
 
 func main() {
 	tune.Init()
+
 	// Configure tracing
 	tracer.Start(
-		tracer.WithEnv("staging"),
+		tracer.WithEnv("aiopslab"),
 		tracer.WithService("geo"),
 		tracer.WithServiceVersion("1.0"),
 	)
-	// When the tracer is stopped, it will flush everything it has to the Datadog Agent before quitting.
-	// Make sure this line stays in your main function.
-	defer tracer.Stop()
+	defer tracer.Stop() // Ensure tracer flushes before exit.
 
 	// Configure logger
 	datadogWriter := &datadogwriter.DatadogWriter{
 		Service:  "geo",
 		Hostname: "localhost",
-		Tags:     "env:staging,version:1.0",
+		Tags:     "env:aiopslab,version:1.0",
 		Source:   "geo-service",
 	}
 	log.Logger = zerolog.New(io.MultiWriter(os.Stdout, datadogWriter)).With().Timestamp().Logger()
+
+	// Root context with cancellation for the service lifecycle
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	log.Info().Msg("Reading config locally...")
 	jsonFile, err := os.Open("config.json")
 	if err != nil {
 		log.Error().Msgf("Got error while reading config: %v", err)
 	}
-
 	defer jsonFile.Close()
 
 	byteValue, _ := ioutil.ReadAll(jsonFile)
-
 	var result map[string]string
 	json.Unmarshal([]byte(byteValue), &result)
 
 	log.Info().Msgf("Read database URL: %v", result["GeoMongoAddress"])
 	log.Info().Msg("Initializing DB connection...")
-	mongo_session := initializeDatabase(result["GeoMongoAddress"])
-	defer mongo_session.Close()
-	log.Info().Msg("Successfull")
 
-	serv_port, _ := strconv.Atoi(result["GeoPort"])
-	serv_ip := result["GeoIP"]
+	// Trace MongoDB initialization
+	// dbInitSpan, ctx := tracer.StartSpanFromContext(ctx, "geo.initializeDatabase", tracer.ResourceName("MongoDB Connection"))
+	// dbInitSpan.SetTag(ext.DBInstance, "GeoMongo")
+	mongoSession := initializeDatabase(ctx, result["GeoMongoAddress"])
+	defer mongoSession.Close()
+	// dbInitSpan.Finish()
 
-	log.Info().Msgf("Read target port: %v", serv_port)
+	log.Info().Msg("Database connection successful.")
+
+	servPort, _ := strconv.Atoi(result["GeoPort"])
+	servIP := result["GeoIP"]
+
+	log.Info().Msgf("Read target port: %v", servPort)
 	log.Info().Msgf("Read consul address: %v", result["consulAddress"])
-	// log.Info().Msgf("Read jaeger address: %v", result["jaegerAddress"])
-	var (
-		// port       = flag.Int("port", 8083, "Server port")
-		// jaegeraddr = flag.String("jaegeraddr", result["jaegerAddress"], "Jaeger address")
-		consuladdr = flag.String("consuladdr", result["consulAddress"], "Consul address")
-	)
+
+	consulAddr := flag.String("consuladdr", result["consulAddress"], "Consul address")
 	flag.Parse()
 
-	// log.Info().Msgf("Initializing jaeger agent [service name: %v | host: %v]...", "geo", *jaegeraddr)
-
-	// tracer, err := tracing.Init("geo", *jaegeraddr)
-	// if err != nil {
-	// 	log.Panic().Msgf("Got error while initializing jaeger agent: %v", err)
-	// }
-	// log.Info().Msg("Jaeger agent initialized")
-
-	log.Info().Msgf("Initializing consul agent [host: %v]...", *consuladdr)
-	registry, err := registry.NewClient(*consuladdr)
+	log.Info().Msgf("Initializing consul agent [host: %v]...", *consulAddr)
+	registry, err := registry.NewClient(*consulAddr)
 	if err != nil {
 		log.Panic().Msgf("Got error while initializing consul agent: %v", err)
 	}
-	log.Info().Msg("Consul agent initialized")
+	log.Info().Msg("Consul agent initialized.")
 
 	srv := &geo.Server{
-		// Port:     *port,
-		Port:   serv_port,
-		IpAddr: serv_ip,
-		// Tracer:       tracer,
+		Port:         servPort,
+		IpAddr:       servIP,
 		Registry:     registry,
-		MongoSession: mongo_session,
+		MongoSession: mongoSession,
 	}
 
+	// // Trace server run
+	// serverRunSpan, ctx := tracer.StartSpanFromContext(ctx, "geo.server.Run", tracer.ResourceName("GeoServer"))
+	// defer serverRunSpan.Finish()
+
 	log.Info().Msg("Starting server...")
-	log.Fatal().Msg(srv.Run().Error())
+	if err := srv.Run(); err != nil {
+		// serverRunSpan.SetTag(ext.Error, true)
+		// serverRunSpan.SetTag("error.message", err.Error())
+		log.Fatal().Msg(err.Error())
+	}
 }

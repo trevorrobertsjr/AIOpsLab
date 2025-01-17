@@ -1,10 +1,12 @@
 package frontend
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"google.golang.org/grpc"
 
@@ -19,6 +21,8 @@ import (
 	search "github.com/harlow/go-micro-services/services/search/proto"
 	"github.com/harlow/go-micro-services/tls"
 	httptrace "gopkg.in/DataDog/dd-trace-go.v1/contrib/net/http"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 )
 
 // Server implements frontend service
@@ -36,34 +40,34 @@ type Server struct {
 }
 
 // Run the server
-func (s *Server) Run() error {
+func (s *Server) Run(ctx context.Context) error {
 	if s.Port == 0 {
 		return fmt.Errorf("Server port must be set")
 	}
 
 	log.Info().Msg("Initializing gRPC clients...")
-	if err := s.initSearchClient("srv-search"); err != nil {
+	if err := s.initSearchClient(ctx, "srv-search"); err != nil {
 		return err
 	}
 
-	if err := s.initProfileClient("srv-profile"); err != nil {
+	if err := s.initProfileClient(ctx, "srv-profile"); err != nil {
 		return err
 	}
 
-	if err := s.initRecommendationClient("srv-recommendation"); err != nil {
+	if err := s.initRecommendationClient(ctx, "srv-recommendation"); err != nil {
 		return err
 	}
 
-	if err := s.initUserClient("srv-user"); err != nil {
+	if err := s.initUserClient(ctx, "srv-user"); err != nil {
 		return err
 	}
 
-	if err := s.initReservation("srv-reservation"); err != nil {
+	if err := s.initReservation(ctx, "srv-reservation"); err != nil {
 		return err
 	}
-	log.Info().Msg("Successfull")
+	log.Info().Msg("Successfully initialized gRPC clients")
 
-	log.Trace().Msg("frontend before mux")
+	// Create HTTP mux with tracing support
 	mux := httptrace.NewServeMux()
 	mux.Handle("/", http.FileServer(http.Dir("services/frontend/static")))
 	mux.Handle("/hotels", httptrace.WrapHandler(http.HandlerFunc(s.searchHandler), "frontend", "/hotels"))
@@ -71,25 +75,27 @@ func (s *Server) Run() error {
 	mux.Handle("/user", httptrace.WrapHandler(http.HandlerFunc(s.userHandler), "frontend", "/user"))
 	mux.Handle("/reservation", httptrace.WrapHandler(http.HandlerFunc(s.reservationHandler), "frontend", "/reservation"))
 
-	log.Trace().Msg("frontend starts serving")
-
-	tlsconfig := tls.GetHttpsOpt()
+	// Configure and start the HTTP server
+	log.Info().Msg("Starting HTTP server")
+	tlsConfig := tls.GetHttpsOpt()
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", s.Port),
 		Handler: mux,
 	}
-	if tlsconfig != nil {
-		log.Info().Msg("Serving https")
-		srv.TLSConfig = tlsconfig
+
+	if tlsConfig != nil {
+		log.Info().Msg("Serving HTTPS")
+		srv.TLSConfig = tlsConfig
 		return srv.ListenAndServeTLS("x509/server_cert.pem", "x509/server_key.pem")
 	} else {
-		log.Info().Msg("Serving http")
+		log.Info().Msg("Serving HTTP")
 		return srv.ListenAndServe()
 	}
 }
 
-func (s *Server) initSearchClient(name string) error {
-	conn, err := s.getGrpcConn(name)
+// Updated gRPC initialization to use context
+func (s *Server) initSearchClient(ctx context.Context, name string) error {
+	conn, err := s.getGrpcConn(ctx, name)
 	if err != nil {
 		return fmt.Errorf("dialer error: %v", err)
 	}
@@ -97,8 +103,8 @@ func (s *Server) initSearchClient(name string) error {
 	return nil
 }
 
-func (s *Server) initProfileClient(name string) error {
-	conn, err := s.getGrpcConn(name)
+func (s *Server) initProfileClient(ctx context.Context, name string) error {
+	conn, err := s.getGrpcConn(ctx, name)
 	if err != nil {
 		return fmt.Errorf("dialer error: %v", err)
 	}
@@ -106,8 +112,8 @@ func (s *Server) initProfileClient(name string) error {
 	return nil
 }
 
-func (s *Server) initRecommendationClient(name string) error {
-	conn, err := s.getGrpcConn(name)
+func (s *Server) initRecommendationClient(ctx context.Context, name string) error {
+	conn, err := s.getGrpcConn(ctx, name)
 	if err != nil {
 		return fmt.Errorf("dialer error: %v", err)
 	}
@@ -115,8 +121,8 @@ func (s *Server) initRecommendationClient(name string) error {
 	return nil
 }
 
-func (s *Server) initUserClient(name string) error {
-	conn, err := s.getGrpcConn(name)
+func (s *Server) initUserClient(ctx context.Context, name string) error {
+	conn, err := s.getGrpcConn(ctx, name)
 	if err != nil {
 		return fmt.Errorf("dialer error: %v", err)
 	}
@@ -124,8 +130,8 @@ func (s *Server) initUserClient(name string) error {
 	return nil
 }
 
-func (s *Server) initReservation(name string) error {
-	conn, err := s.getGrpcConn(name)
+func (s *Server) initReservation(ctx context.Context, name string) error {
+	conn, err := s.getGrpcConn(ctx, name)
 	if err != nil {
 		return fmt.Errorf("dialer error: %v", err)
 	}
@@ -133,18 +139,62 @@ func (s *Server) initReservation(name string) error {
 	return nil
 }
 
-func (s *Server) getGrpcConn(name string) (*grpc.ClientConn, error) {
-	// If Knative DNS is configured, use it for the service address
+// func (s *Server) getGrpcConn(ctx context.Context, name string) (*grpc.ClientConn, error) {
+// 	span, ctx := tracer.StartSpanFromContext(ctx, "getGrpcConn", tracer.ResourceName("Dial gRPC Connection"))
+// 	defer span.Finish()
+
+// 	var target string
+// 	if s.KnativeDns != "" {
+// 		target = fmt.Sprintf("%s.%s", name, s.KnativeDns)
+// 		log.Info().Msgf("Dialing Knative DNS target: %s", target)
+// 	} else {
+// 		target = fmt.Sprintf("consul:///%s", name)
+// 		log.Info().Msgf("Dialing Consul target: %s", target)
+// 	}
+
+// 	// Use the updated Dial function with the unary interceptor
+// 	conn, err := dialer.Dial(ctx, target,
+// 		// grpc.WithStatsHandler(&dialer.TracerStatsHandler{}), // Existing stats handler
+// 		dialer.WithUnaryInterceptor(), // Add unary interceptor
+// 	)
+// 	if err != nil {
+// 		span.SetTag(ext.Error, true)
+// 		span.SetTag("error.message", err.Error())
+// 		log.Error().Msgf("Failed to dial target %s: %v", target, err)
+// 		return nil, err
+// 	}
+
+// 	span.SetTag("grpc.target", target)
+// 	log.Info().Msgf("Successfully connected to gRPC target: %s", target)
+// 	return conn, nil
+// }
+
+func (s *Server) getGrpcConn(ctx context.Context, name string) (*grpc.ClientConn, error) {
+	span, ctx := tracer.StartSpanFromContext(ctx, "getGrpcConn", tracer.ResourceName("Dial gRPC Connection"))
+	defer span.Finish()
+
+	var target string
 	if s.KnativeDns != "" {
-		target := fmt.Sprintf("%s.%s", name, s.KnativeDns)
+		target = fmt.Sprintf("%s.%s", name, s.KnativeDns)
 		log.Info().Msgf("Dialing Knative DNS target: %s", target)
-		return dialer.Dial(target, dialer.WithTracer())
+	} else {
+		target = fmt.Sprintf("consul:///%s", name)
+		log.Info().Msgf("Dialing Consul target: %s", target)
 	}
 
-	// Default to Consul-based service discovery
-	target := fmt.Sprintf("consul:///%s", name)
-	log.Info().Msgf("Dialing Consul target: %s at %s for %s", target, s.Registry.Address(), name)
-	return dialer.Dial(target, dialer.WithTracer())
+	conn, err := dialer.Dial(ctx, target,
+		dialer.WithUnaryInterceptor(), // Add unary interceptor
+	)
+	if err != nil {
+		span.SetTag(ext.Error, true)
+		span.SetTag("error.message", err.Error())
+		log.Error().Msgf("Failed to dial target %s: %v", target, err)
+		return nil, err
+	}
+
+	span.SetTag("grpc.target", target)
+	log.Info().Msgf("Successfully connected to gRPC target: %s", target)
+	return conn, nil
 }
 
 // DEBUG
@@ -178,6 +228,12 @@ func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 	log.Debug().Msgf("Parsed request parameters: lat=%v, lon=%v, inDate=%s, outDate=%s", lat, lon, inDate, outDate)
 
 	// search for best hotels
+	searchSpan, ctx := tracer.StartSpanFromContext(ctx, "grpc.call", tracer.ResourceName("search.Nearby"))
+	searchSpan.SetTag(ext.Component, "grpc-client")
+	searchSpan.SetTag(ext.SpanKind, ext.SpanKindClient)
+	searchSpan.SetTag("grpc.method", "Nearby")
+	defer searchSpan.Finish()
+
 	searchResp, err := s.searchClient.Nearby(ctx, &search.NearbyRequest{
 		Lat:     lat,
 		Lon:     lon,
@@ -185,6 +241,8 @@ func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 		OutDate: outDate,
 	})
 	if err != nil {
+		searchSpan.SetTag(ext.Error, true)
+		searchSpan.SetTag("error.message", err.Error())
 		log.Error().Err(err).Msg("Error fetching search results")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -232,316 +290,178 @@ func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) recommendHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	ctx := r.Context()
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
 
 	log.Trace().Msg("recommendHandler invoked")
 
 	// Parse latitude and longitude
 	sLat, sLon := r.URL.Query().Get("lat"), r.URL.Query().Get("lon")
 	if sLat == "" || sLon == "" {
-		log.Debug().Msg("lat or lon parameter is missing")
-		http.Error(w, "Please specify location params", http.StatusBadRequest)
+		http.Error(w, "Missing 'lat' or 'lon' query parameter", http.StatusBadRequest)
 		return
 	}
 	Lat, _ := strconv.ParseFloat(sLat, 64)
-	lat := float64(Lat)
 	Lon, _ := strconv.ParseFloat(sLon, 64)
-	lon := float64(Lon)
 
 	// Parse 'require' parameter
 	require := r.URL.Query().Get("require")
 	if require != "dis" && require != "rate" && require != "price" {
-		log.Debug().Msg("Invalid or missing 'require' parameter")
-		http.Error(w, "Please specify require params", http.StatusBadRequest)
+		http.Error(w, "Invalid 'require' parameter. Use 'dis', 'rate', or 'price'.", http.StatusBadRequest)
 		return
 	}
 
-	log.Debug().Msgf("Parsed request parameters: lat=%v, lon=%v, require=%s", lat, lon, require)
+	recommendSpan, ctx := tracer.StartSpanFromContext(ctx, "grpc.call", tracer.ResourceName("recommendation.GetRecommendations"))
+	recommendSpan.SetTag(ext.Component, "grpc-client")
+	recommendSpan.SetTag("require", require)
+	defer recommendSpan.Finish()
 
-	// fetch recommendations
+	// Fetch recommendations
 	recResp, err := s.recommendationClient.GetRecommendations(ctx, &recommendation.Request{
 		Require: require,
-		Lat:     lat,
-		Lon:     lon,
+		Lat:     Lat,
+		Lon:     Lon,
 	})
 	if err != nil {
+		recommendSpan.SetTag(ext.Error, true)
+		recommendSpan.SetTag("error.message", err.Error())
 		log.Error().Err(err).Msg("Error fetching recommendations")
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Failed to fetch recommendations", http.StatusInternalServerError)
 		return
 	}
 
-	log.Debug().Msgf("Received recommendations with hotel IDs: %v", recResp.HotelIds)
+	log.Debug().Msgf("Received recommendations: %v", recResp.HotelIds)
 
-	// grab locale from query params or default to en
-	locale := r.URL.Query().Get("locale")
-	if locale == "" {
-		locale = "en"
-	}
+	// Fetch hotel profiles
+	profileSpan, ctx := tracer.StartSpanFromContext(ctx, "grpc.call", tracer.ResourceName("profile.GetProfiles"))
+	profileSpan.SetTag(ext.Component, "grpc-client")
+	defer profileSpan.Finish()
 
-	// fetch hotel profiles
 	profileResp, err := s.profileClient.GetProfiles(ctx, &profile.Request{
 		HotelIds: recResp.HotelIds,
-		Locale:   locale,
+		Locale:   r.URL.Query().Get("locale"),
 	})
 	if err != nil {
+		profileSpan.SetTag(ext.Error, true)
+		profileSpan.SetTag("error.message", err.Error())
 		log.Error().Err(err).Msg("Error fetching hotel profiles")
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Failed to fetch hotel profiles", http.StatusInternalServerError)
 		return
 	}
 
-	log.Debug().Msgf("Profile response received with hotels: %+v", profileResp.Hotels)
+	log.Debug().Msgf("Profile response: %+v", profileResp.Hotels)
 
 	json.NewEncoder(w).Encode(geoJSONResponse(profileResp.Hotels))
-	log.Trace().Msg("recommendHandler completed successfully")
 }
-
-// DEBUG
-
-// func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
-// 	w.Header().Set("Access-Control-Allow-Origin", "*")
-// 	ctx := r.Context()
-
-// 	// Start a new Datadog span
-// 	span, ctx := tracer.StartSpanFromContext(ctx, "frontend.searchHandler", tracer.ServiceName("frontend"))
-// 	defer span.Finish()
-
-// 	log.Trace().Msg("starts searchHandler")
-
-// 	// in/out dates from query params
-// 	inDate, outDate := r.URL.Query().Get("inDate"), r.URL.Query().Get("outDate")
-// 	if inDate == "" || outDate == "" {
-// 		http.Error(w, "Please specify inDate/outDate params", http.StatusBadRequest)
-// 		span.SetTag(ext.Error, true)
-// 		return
-// 	}
-
-// 	// lan/lon from query params
-// 	sLat, sLon := r.URL.Query().Get("lat"), r.URL.Query().Get("lon")
-// 	if sLat == "" || sLon == "" {
-// 		http.Error(w, "Please specify location params", http.StatusBadRequest)
-// 		return
-// 	}
-
-// 	Lat, _ := strconv.ParseFloat(sLat, 32)
-// 	lat := float32(Lat)
-// 	Lon, _ := strconv.ParseFloat(sLon, 32)
-// 	lon := float32(Lon)
-
-// 	log.Trace().Msg("starts searchHandler querying downstream")
-
-// 	log.Trace().Msgf("SEARCH [lat: %v, lon: %v, inDate: %v, outDate: %v", lat, lon, inDate, outDate)
-// 	// search for best hotels
-// 	searchResp, err := s.searchClient.Nearby(ctx, &search.NearbyRequest{
-// 		Lat:     lat,
-// 		Lon:     lon,
-// 		InDate:  inDate,
-// 		OutDate: outDate,
-// 	})
-// 	if err != nil {
-// 		http.Error(w, err.Error(), http.StatusInternalServerError)
-// 		return
-// 	}
-
-// 	log.Trace().Msg("SearchHandler gets searchResp")
-// 	//for _, hid := range searchResp.HotelIds {
-// 	//	log.Trace().Msgf("Search Handler hotelId = %s", hid)
-// 	//}
-
-// 	// grab locale from query params or default to en
-// 	locale := r.URL.Query().Get("locale")
-// 	if locale == "" {
-// 		locale = "en"
-// 	}
-
-// 	reservationResp, err := s.reservationClient.CheckAvailability(ctx, &reservation.Request{
-// 		CustomerName: "",
-// 		HotelId:      searchResp.HotelIds,
-// 		InDate:       inDate,
-// 		OutDate:      outDate,
-// 		RoomNumber:   1,
-// 	})
-// 	if err != nil {
-// 		log.Error().Msg("SearchHandler CheckAvailability failed")
-// 		http.Error(w, err.Error(), http.StatusInternalServerError)
-// 		return
-// 	}
-
-// 	log.Trace().Msgf("searchHandler gets reserveResp")
-// 	log.Trace().Msgf("searchHandler gets reserveResp.HotelId = %s", reservationResp.HotelId)
-
-// 	// hotel profiles
-// 	profileResp, err := s.profileClient.GetProfiles(ctx, &profile.Request{
-// 		HotelIds: reservationResp.HotelId,
-// 		Locale:   locale,
-// 	})
-// 	if err != nil {
-// 		log.Error().Msg("SearchHandler GetProfiles failed")
-// 		http.Error(w, err.Error(), http.StatusInternalServerError)
-// 		return
-// 	}
-
-// 	log.Trace().Msg("searchHandler gets profileResp")
-
-// 	json.NewEncoder(w).Encode(geoJSONResponse(profileResp.Hotels))
-// }
-
-// func (s *Server) recommendHandler(w http.ResponseWriter, r *http.Request) {
-// 	w.Header().Set("Access-Control-Allow-Origin", "*")
-// 	ctx := r.Context()
-
-// 	sLat, sLon := r.URL.Query().Get("lat"), r.URL.Query().Get("lon")
-// 	if sLat == "" || sLon == "" {
-// 		http.Error(w, "Please specify location params", http.StatusBadRequest)
-// 		return
-// 	}
-// 	Lat, _ := strconv.ParseFloat(sLat, 64)
-// 	lat := float64(Lat)
-// 	Lon, _ := strconv.ParseFloat(sLon, 64)
-// 	lon := float64(Lon)
-
-// 	require := r.URL.Query().Get("require")
-// 	if require != "dis" && require != "rate" && require != "price" {
-// 		http.Error(w, "Please specify require params", http.StatusBadRequest)
-// 		return
-// 	}
-
-// 	// recommend hotels
-// 	recResp, err := s.recommendationClient.GetRecommendations(ctx, &recommendation.Request{
-// 		Require: require,
-// 		Lat:     float64(lat),
-// 		Lon:     float64(lon),
-// 	})
-// 	if err != nil {
-// 		http.Error(w, err.Error(), http.StatusInternalServerError)
-// 		return
-// 	}
-
-// 	// grab locale from query params or default to en
-// 	locale := r.URL.Query().Get("locale")
-// 	if locale == "" {
-// 		locale = "en"
-// 	}
-
-// 	// hotel profiles
-// 	profileResp, err := s.profileClient.GetProfiles(ctx, &profile.Request{
-// 		HotelIds: recResp.HotelIds,
-// 		Locale:   locale,
-// 	})
-// 	if err != nil {
-// 		http.Error(w, err.Error(), http.StatusInternalServerError)
-// 		return
-// 	}
-
-// 	json.NewEncoder(w).Encode(geoJSONResponse(profileResp.Hotels))
-// }
 
 func (s *Server) userHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	ctx := r.Context()
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
 
 	username, password := r.URL.Query().Get("username"), r.URL.Query().Get("password")
 	if username == "" || password == "" {
-		http.Error(w, "Please specify username and password", http.StatusBadRequest)
+		http.Error(w, "Missing 'username' or 'password' parameter", http.StatusBadRequest)
 		return
 	}
 
-	// Check username and password
+	log.Debug().Msgf("Checking user credentials for username: %s", username)
+
+	userSpan, ctx := tracer.StartSpanFromContext(ctx, "grpc.call", tracer.ResourceName("user.CheckUser"))
+	userSpan.SetTag(ext.Component, "grpc-client")
+	userSpan.SetTag("username", username)
+	defer userSpan.Finish()
+
 	recResp, err := s.userClient.CheckUser(ctx, &user.Request{
 		Username: username,
 		Password: password,
 	})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		userSpan.SetTag(ext.Error, true)
+		userSpan.SetTag("error.message", err.Error())
+		log.Error().Err(err).Msg("Error checking user credentials")
+		http.Error(w, "Failed to validate user credentials", http.StatusInternalServerError)
 		return
 	}
 
-	str := "Login successfully!"
-	if recResp.Correct == false {
-		str = "Failed. Please check your username and password. "
+	message := "Login successfully!"
+	if !recResp.Correct {
+		message = "Login failed. Please check your username and password."
 	}
 
-	res := map[string]interface{}{
-		"message": str,
-	}
-
-	json.NewEncoder(w).Encode(res)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"message": message,
+	})
 }
 
 func (s *Server) reservationHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	ctx := r.Context()
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
 
 	inDate, outDate := r.URL.Query().Get("inDate"), r.URL.Query().Get("outDate")
-	if inDate == "" || outDate == "" {
-		http.Error(w, "Please specify inDate/outDate params", http.StatusBadRequest)
-		return
-	}
-
-	if !checkDataFormat(inDate) || !checkDataFormat(outDate) {
-		http.Error(w, "Please check inDate/outDate format (YYYY-MM-DD)", http.StatusBadRequest)
+	if inDate == "" || outDate == "" || !checkDataFormat(inDate) || !checkDataFormat(outDate) {
+		http.Error(w, "Invalid 'inDate' or 'outDate' format. Expected YYYY-MM-DD.", http.StatusBadRequest)
 		return
 	}
 
 	hotelId := r.URL.Query().Get("hotelId")
-	if hotelId == "" {
-		http.Error(w, "Please specify hotelId params", http.StatusBadRequest)
-		return
-	}
-
 	customerName := r.URL.Query().Get("customerName")
-	if customerName == "" {
-		http.Error(w, "Please specify customerName params", http.StatusBadRequest)
+	if hotelId == "" || customerName == "" {
+		http.Error(w, "Missing 'hotelId' or 'customerName' parameter", http.StatusBadRequest)
 		return
 	}
 
 	username, password := r.URL.Query().Get("username"), r.URL.Query().Get("password")
 	if username == "" || password == "" {
-		http.Error(w, "Please specify username and password", http.StatusBadRequest)
+		http.Error(w, "Missing 'username' or 'password' parameter", http.StatusBadRequest)
 		return
 	}
 
-	numberOfRoom := 0
-	num := r.URL.Query().Get("number")
-	if num != "" {
-		numberOfRoom, _ = strconv.Atoi(num)
-	}
+	roomCount, _ := strconv.Atoi(r.URL.Query().Get("number"))
 
-	// Check username and password
+	log.Debug().Msgf("Making reservation for hotelId: %s, customer: %s", hotelId, customerName)
+
+	userSpan, ctx := tracer.StartSpanFromContext(ctx, "grpc.call", tracer.ResourceName("user.CheckUser"))
+	userSpan.SetTag(ext.Component, "grpc-client")
+	userSpan.SetTag("username", username)
+	defer userSpan.Finish()
+
 	recResp, err := s.userClient.CheckUser(ctx, &user.Request{
 		Username: username,
 		Password: password,
 	})
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if err != nil || !recResp.Correct {
+		userSpan.SetTag(ext.Error, true)
+		userSpan.SetTag("error.message", "Invalid credentials")
+		log.Error().Msg("User validation failed")
+		http.Error(w, "Invalid username or password", http.StatusUnauthorized)
 		return
 	}
 
-	str := "Reserve successfully!"
-	if recResp.Correct == false {
-		str = "Failed. Please check your username and password. "
-	}
+	reservationSpan, ctx := tracer.StartSpanFromContext(ctx, "grpc.call", tracer.ResourceName("reservation.MakeReservation"))
+	reservationSpan.SetTag(ext.Component, "grpc-client")
+	reservationSpan.SetTag("hotelId", hotelId)
+	defer reservationSpan.Finish()
 
-	// Make reservation
 	resResp, err := s.reservationClient.MakeReservation(ctx, &reservation.Request{
 		CustomerName: customerName,
 		HotelId:      []string{hotelId},
 		InDate:       inDate,
 		OutDate:      outDate,
-		RoomNumber:   int32(numberOfRoom),
+		RoomNumber:   int32(roomCount),
 	})
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if err != nil || len(resResp.HotelId) == 0 {
+		reservationSpan.SetTag(ext.Error, true)
+		reservationSpan.SetTag("error.message", "Failed to reserve")
+		log.Error().Err(err).Msg("Reservation failed")
+		http.Error(w, "Reservation failed. Rooms may be fully booked.", http.StatusConflict)
 		return
 	}
-	if len(resResp.HotelId) == 0 {
-		str = "Failed. Already reserved. "
-	}
 
-	res := map[string]interface{}{
-		"message": str,
-	}
-
-	json.NewEncoder(w).Encode(res)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"message": "Reservation successful!",
+	})
 }
 
 // return a geoJSON response that allows google map to plot points directly on map

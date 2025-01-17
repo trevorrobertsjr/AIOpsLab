@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"strconv"
@@ -15,7 +16,7 @@ type User struct {
 	Password string `bson:"password"`
 }
 
-func initializeDatabase(url string) *mgo.Session {
+func initializeDatabase(ctx context.Context, url string) *mgo.Session {
 	session, err := mgo.Dial(url)
 	if err != nil {
 		log.Panic().Msg(err.Error())
