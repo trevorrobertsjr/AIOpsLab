@@ -39,6 +39,7 @@ class Wrk:
 
         command = f"wrk -D {self.dist} -t {self.threads} -c {self.connections} -d {self.duration} -L -s {payload_script} {url} -R {self.rate}"
         command += " --latency" if self.latency else ""
+        print(f"command: {command}")
         process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE)
         output, error = process.communicate()
 

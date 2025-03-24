@@ -33,6 +33,7 @@ class KubeCtl:
     def get_cluster_ip(self, service_name, namespace):
         """Retrieve the cluster IP address of a specified service within a namespace."""
         service_info = self.core_v1_api.read_namespaced_service(service_name, namespace)
+        print(service_info)
         return service_info.spec.cluster_ip  # type: ignore
 
     def get_pod_name(self, namespace, label_selector):

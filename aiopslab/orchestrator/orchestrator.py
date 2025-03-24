@@ -9,6 +9,7 @@ from aiopslab.orchestrator.problems.registry import ProblemRegistry
 from aiopslab.orchestrator.parser import ResponseParser
 from aiopslab.utils.status import *
 from aiopslab.service.telemetry.prometheus import Prometheus
+import time
 
 
 class Orchestrator:
@@ -111,41 +112,52 @@ class Orchestrator:
         action, env_response, results = "", "", {}
         self.session.start()
 
-        for step in range(max_steps):
-            action = await self.ask_agent(action_instr)
-            self.sprint.agent(action)
+        # for step in range(max_steps):
+        #     action = await self.ask_agent(action_instr)
+        #     self.sprint.agent(action)
 
-            env_response = await self.ask_env(action)
-            self.sprint.service(env_response)
+        #     env_response = await self.ask_env(action)
+        #     self.sprint.service(env_response)
 
-            if env_response == SubmissionStatus.VALID_SUBMISSION:
-                break
-            elif env_response == SubmissionStatus.INVALID_SUBMISSION:
-                raise ValueError("Invalid submission!")  # TODO (@manish): ask to retry?
+        #     if env_response == SubmissionStatus.VALID_SUBMISSION:
+        #         break
+        #     elif env_response == SubmissionStatus.INVALID_SUBMISSION:
+        #         raise ValueError("Invalid submission!")  # TODO (@manish): ask to retry?
 
-            action_instr = env_response + "\n" + "Please take the next action"
+        #     action_instr = env_response + "\n" + "Please take the next action"
+        time.sleep(5)
 
         self.session.end()
 
-        # A valid submission was made (or) max_steps reached
-        if env_response != SubmissionStatus.INVALID_SUBMISSION:
-            results = self.session.problem.eval(
-                self.session.solution, self.session.history, self.session.get_duration()
-            )
-            self.sprint.result(results)
+        # # A valid submission was made (or) max_steps reached
+        # if env_response != SubmissionStatus.INVALID_SUBMISSION:
+        #     results = self.session.problem.eval(
+        #         self.session.solution, self.session.history, self.session.get_duration()
+        #     )
+        #     self.sprint.result(results)
 
-        self.session.set_results(results)
-        self.session.to_json()
+        # self.session.set_results(results)
+        # self.session.to_json()
         self.session.problem.recover_fault()
 
         # Beyond recovering from fault,
         # I feel sometimes it is safer to delete the whole namespace.
         # But this will take more time.
         # if not self.session.problem.sys_status_after_recovery():
-        self.session.problem.app.cleanup()
+        # self.session.problem.app.cleanup()
 
+        # Using delete instead of cleanup to preserve the namespace with the aiopslab-console running in it
+        self.session.problem.app.delete()
+        
+
+        # return {
+        #     "history": self.session.history,
+        #     "final_state": env_response,
+        #     "results": results,
+        # }
         return {
-            "history": self.session.history,
-            "final_state": env_response,
-            "results": results,
+            "history": "self.session.history",
+            "final_state": SubmissionStatus.VALID_SUBMISSION,
+            "results": "result",
         }
+
