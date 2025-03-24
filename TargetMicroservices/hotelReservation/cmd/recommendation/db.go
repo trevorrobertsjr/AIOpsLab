@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"strconv"
 
 	"github.com/rs/zerolog/log"
@@ -16,7 +17,7 @@ type Hotel struct {
 	HPrice float64 `bson:"price"`
 }
 
-func initializeDatabase(url string) *mgo.Session {
+func initializeDatabase(ctx context.Context, url string) *mgo.Session {
 	session, err := mgo.Dial(url)
 	if err != nil {
 		log.Panic().Msg(err.Error())

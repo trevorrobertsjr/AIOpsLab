@@ -1,32 +1,50 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
+	"io"
 	"io/ioutil"
 	"os"
-	"time"
-
 	"strconv"
 
 	"github.com/harlow/go-micro-services/registry"
 	"github.com/harlow/go-micro-services/services/recommendation"
-	"github.com/harlow/go-micro-services/tracing"
 	"github.com/harlow/go-micro-services/tune"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"github.com/trevorrobertsjr/datadogwriter"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 )
 
 func main() {
 	tune.Init()
-	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}).With().Timestamp().Caller().Logger()
+	// Create root context for tracing
+	ctx := context.Background()
+
+	// Configure tracing
+	tracer.Start(
+		tracer.WithEnv("aiopslab"),
+		tracer.WithService("recommendation"),
+		tracer.WithServiceVersion("1.0"),
+	)
+	defer tracer.Stop()
+
+	// Configure logging
+	datadogWriter := &datadogwriter.DatadogWriter{
+		Service:  "recommendation",
+		Hostname: "localhost",
+		Tags:     "env:aiopslab,version:1.0",
+		Source:   "recommendation-service",
+	}
+	log.Logger = zerolog.New(io.MultiWriter(os.Stdout, datadogWriter)).With().Timestamp().Logger()
 
 	log.Info().Msg("Reading config...")
 	jsonFile, err := os.Open("config.json")
 	if err != nil {
 		log.Error().Msgf("Got error while reading config: %v", err)
 	}
-
 	defer jsonFile.Close()
 
 	byteValue, _ := ioutil.ReadAll(jsonFile)
@@ -36,47 +54,42 @@ func main() {
 
 	log.Info().Msgf("Read database URL: %v", result["RecommendMongoAddress"])
 	log.Info().Msg("Initializing DB connection...")
-	mongo_session := initializeDatabase(result["RecommendMongoAddress"])
-	defer mongo_session.Close()
-	log.Info().Msg("Successfull")
+	mongoSession := initializeDatabase(ctx, result["RecommendMongoAddress"])
+	defer mongoSession.Close()
+	log.Info().Msg("Database initialization successful")
 
-	serv_port, _ := strconv.Atoi(result["RecommendPort"])
-	serv_ip := result["RecommendIP"]
+	servPort, _ := strconv.Atoi(result["RecommendPort"])
+	servIP := result["RecommendIP"]
 
-	log.Info().Msgf("Read target port: %v", serv_port)
+	log.Info().Msgf("Read target port: %v", servPort)
 	log.Info().Msgf("Read consul address: %v", result["consulAddress"])
-	log.Info().Msgf("Read jaeger address: %v", result["jaegerAddress"])
 
 	var (
-		// port       = flag.Int("port", 8085, "The server port")
-		jaegeraddr = flag.String("jaegeraddr", result["jaegerAddress"], "Jaeger server addr")
-		consuladdr = flag.String("consuladdr", result["consulAddress"], "Consul address")
+		consulAddr = flag.String("consuladdr", result["consulAddress"], "Consul address")
 	)
 	flag.Parse()
 
-	log.Info().Msgf("Initializing jaeger agent [service name: %v | host: %v]...", "recommendation", *jaegeraddr)
-	tracer, err := tracing.Init("recommendation", *jaegeraddr)
+	log.Info().Msgf("Initializing consul agent [host: %v]...", *consulAddr)
+	registry, err := registry.NewClient(*consulAddr)
 	if err != nil {
-		log.Panic().Msgf("Got error while initializing jaeger agent: %v", err)
-	}
-	log.Info().Msg("Jaeger agent initialized")
-
-	log.Info().Msgf("Initializing consul agent [host: %v]...", *consuladdr)
-	registry, err := registry.NewClient(*consuladdr)
-	if err != nil {
-		log.Panic().Msgf("Got error while initializing consul agent: %v", err)
+		log.Panic().Msgf("Error initializing consul agent: %v", err)
 	}
 	log.Info().Msg("Consul agent initialized")
 
 	srv := &recommendation.Server{
-		Tracer: tracer,
-		// Port:     *port,
 		Registry:     registry,
-		Port:         serv_port,
-		IpAddr:       serv_ip,
-		MongoSession: mongo_session,
+		Port:         servPort,
+		IpAddr:       servIP,
+		MongoSession: mongoSession,
 	}
 
+	// serverRunSpan, ctx := tracer.StartSpanFromContext(ctx, "recommendation.server.Run", tracer.ResourceName("RecommendationServer"))
+	// defer serverRunSpan.Finish()
+
 	log.Info().Msg("Starting server...")
-	log.Fatal().Msg(srv.Run().Error())
+	if err := srv.Run(); err != nil {
+		// serverRunSpan.SetTag(ext.Error, true)
+		// serverRunSpan.SetTag("error.message", err.Error())
+		log.Fatal().Msg(err.Error())
+	}
 }

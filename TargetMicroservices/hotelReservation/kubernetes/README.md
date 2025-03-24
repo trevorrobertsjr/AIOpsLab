@@ -3,6 +3,7 @@
 ## Pre-requirements
 
 - A running Kubernetes cluster is needed.
+- A secret in the test-hotel-reservation namespace called `dd-api-key` with the Datadog API key value stored with a key of api-key
 - Pre-requirements mentioned [here](https://github.com/delimitrou/DeathStarBench/blob/master/hotelReservation/README.md) should be met.
 
 ## Running the Hotel Reservation application

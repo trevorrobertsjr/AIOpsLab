@@ -5,14 +5,16 @@ import (
 	"fmt"
 
 	"github.com/google/uuid"
-	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
 	"github.com/harlow/go-micro-services/registry"
 	pb "github.com/harlow/go-micro-services/services/reservation/proto"
 	"github.com/harlow/go-micro-services/tls"
-	"github.com/opentracing/opentracing-go"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/stats"
+	ddgrpc "gopkg.in/DataDog/dd-trace-go.v1/contrib/google.golang.org/grpc"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
 
@@ -24,16 +26,104 @@ import (
 	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/rs/zerolog/log"
 
-	"strings"
 	"strconv"
+	"strings"
 	"sync"
 )
 
 const name = "srv-reservation"
 
+type tracerStatsHandler struct{}
+
+func (t *tracerStatsHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
+	span, ctx := tracer.StartSpanFromContext(ctx, info.FullMethodName, tracer.ResourceName("grpc"))
+	return tracer.ContextWithSpan(ctx, span)
+}
+
+func (t *tracerStatsHandler) HandleRPC(ctx context.Context, rpcStats stats.RPCStats) {
+	span, ok := tracer.SpanFromContext(ctx)
+	if !ok {
+		return
+	}
+
+	switch event := rpcStats.(type) {
+	case *stats.InPayload:
+		span.SetTag("event", "in_payload")
+		span.SetTag("bytes_received", event.Length)
+	case *stats.OutPayload:
+		span.SetTag("event", "out_payload")
+		span.SetTag("bytes_sent", event.Length)
+	case *stats.End:
+		if event.Error != nil {
+			span.SetTag(ext.Error, event.Error)
+		}
+	}
+
+	span.Finish()
+}
+
+func (t *tracerStatsHandler) TagConn(ctx context.Context, _ *stats.ConnTagInfo) context.Context {
+	return ctx
+}
+
+func (t *tracerStatsHandler) HandleConn(context.Context, stats.ConnStats) {}
+
+func UnaryServerInterceptor() grpc.UnaryServerInterceptor {
+	return func(
+		ctx context.Context,
+		req interface{},
+		info *grpc.UnaryServerInfo,
+		handler grpc.UnaryHandler,
+	) (interface{}, error) {
+		span, ctx := tracer.StartSpanFromContext(ctx, info.FullMethod, tracer.ResourceName(info.FullMethod))
+		defer span.Finish()
+
+		resp, err := handler(ctx, req)
+		if err != nil {
+			span.SetTag(ext.Error, true)
+			span.SetTag("error.message", err.Error())
+		}
+
+		return resp, err
+	}
+}
+
+func StreamServerInterceptor() grpc.StreamServerInterceptor {
+	return func(
+		srv interface{},
+		ss grpc.ServerStream,
+		info *grpc.StreamServerInfo,
+		handler grpc.StreamHandler,
+	) error {
+		span, ctx := tracer.StartSpanFromContext(ss.Context(), info.FullMethod, tracer.ResourceName(info.FullMethod))
+		defer span.Finish()
+
+		wrappedStream := &serverStreamWrapper{
+			ServerStream: ss,
+			ctx:          ctx,
+		}
+
+		err := handler(srv, wrappedStream)
+		if err != nil {
+			span.SetTag(ext.Error, true)
+			span.SetTag("error.message", err.Error())
+		}
+
+		return err
+	}
+}
+
+type serverStreamWrapper struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (w *serverStreamWrapper) Context() context.Context {
+	return w.ctx
+}
+
 // Server implements the user service
 type Server struct {
-	Tracer       opentracing.Tracer
 	Port         int
 	IpAddr       string
 	MongoSession *mgo.Session
@@ -44,13 +134,24 @@ type Server struct {
 
 // Run starts the server
 func (s *Server) Run() error {
-	opentracing.SetGlobalTracer(s.Tracer)
 
 	if s.Port == 0 {
 		return fmt.Errorf("server port must be set")
 	}
 
 	s.uuid = uuid.New().String()
+
+	// opts := []grpc.ServerOption{
+	// 	grpc.KeepaliveParams(keepalive.ServerParameters{
+	// 		Timeout: 120 * time.Second,
+	// 	}),
+	// 	grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+	// 		PermitWithoutStream: true,
+	// 	}),
+	// 	grpc.StatsHandler(&tracerStatsHandler{}),          // Datadog tracing
+	// 	grpc.UnaryInterceptor(UnaryServerInterceptor()),   // Add unary interceptor
+	// 	grpc.StreamInterceptor(StreamServerInterceptor()), // Add stream interceptor
+	// }
 
 	opts := []grpc.ServerOption{
 		grpc.KeepaliveParams(keepalive.ServerParameters{
@@ -59,9 +160,8 @@ func (s *Server) Run() error {
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			PermitWithoutStream: true,
 		}),
-		grpc.UnaryInterceptor(
-			otgrpc.OpenTracingServerInterceptor(s.Tracer),
-		),
+		grpc.UnaryInterceptor(ddgrpc.UnaryServerInterceptor()),   // Datadog unary interceptor
+		grpc.StreamInterceptor(ddgrpc.StreamServerInterceptor()), // Datadog stream interceptor
 	}
 
 	if tlsopt := tls.GetServerOpt(); tlsopt != nil {
@@ -77,22 +177,14 @@ func (s *Server) Run() error {
 		log.Fatal().Msgf("failed to listen: %v", err)
 	}
 
-	// register the service
-	// jsonFile, err := os.Open("config.json")
-	// if err != nil {
-	// 	fmt.Println(err)
-	// }
-
-	// defer jsonFile.Close()
-
-	// byteValue, _ := ioutil.ReadAll(jsonFile)
-
-	// var result map[string]string
-	// json.Unmarshal([]byte(byteValue), &result)
-
 	log.Trace().Msgf("In reservation s.IpAddr = %s, port = %d", s.IpAddr, s.Port)
 
-	err = s.Registry.Register(name, s.uuid, s.IpAddr, s.Port)
+	// Construct service DNS address without the prefix
+	namespace := "test-hotel-reservation"                                     // Replace with your namespace
+	serviceDNS := fmt.Sprintf("%s.%s.svc.cluster.local", name[4:], namespace) // Strip "srv-" from `name`
+
+	log.Info().Msgf("Registering service [name: %s, id: %s, address: %s, port: %d]", name, s.uuid, serviceDNS, s.Port)
+	err = s.Registry.Register(name, s.uuid, serviceDNS, s.Port)
 	if err != nil {
 		return fmt.Errorf("failed register: %v", err)
 	}
@@ -136,72 +228,126 @@ func (s *Server) MakeReservation(ctx context.Context, req *pb.Request) (*pb.Resu
 	memc_date_num_map := make(map[string]int)
 
 	for inDate.Before(outDate) {
-		// check reservations
+		// Start a new date iteration span
+		iterationSpan, ctx := tracer.StartSpanFromContext(ctx, "reservation.date_iteration")
+		iterationSpan.SetTag("inDate", inDate.Format("2006-01-02"))
+		defer iterationSpan.Finish()
+
 		count := 0
 		inDate = inDate.AddDate(0, 0, 1)
 		outdate := inDate.String()[0:10]
 
-		// first check memc
-		memc_key := hotelId + "_" + inDate.String()[0:10] + "_" + outdate
-		item, err := s.MemcClient.Get(memc_key)
-		if err == nil {
-			// memcached hit
-			count, _ = strconv.Atoi(string(item.Value))
-			log.Trace().Msgf("memcached hit %s = %d", memc_key, count)
-			memc_date_num_map[memc_key] = count + int(req.RoomNumber)
+		// Memcached Get for reservation count
+		memcKey := hotelId + "_" + inDate.Format("2006-01-02") + "_" + outdate
+		memcGetSpan, ctx := tracer.StartSpanFromContext(ctx, "memcached.get", tracer.ResourceName("GetReservationCount"))
+		memcGetSpan.SetTag("cacheKey", memcKey)
+		memcGetSpan.SetTag(ext.Component, "memcached")
+		item, err := s.MemcClient.Get(memcKey)
+		memcGetSpan.Finish()
 
+		if err == nil {
+			// Memcached hit
+			count, _ = strconv.Atoi(string(item.Value))
+			log.Trace().Msgf("Memcached hit %s = %d", memcKey, count)
+			memc_date_num_map[memcKey] = count + int(req.RoomNumber)
 		} else if err == memcache.ErrCacheMiss {
-			// memcached miss
-			log.Trace().Msgf("memcached miss")
+			// Memcached miss
+			log.Trace().Msgf("Memcached miss")
 			reserve := make([]reservation, 0)
+
+			// MongoDB query for reservation with enhanced tagging
+			mongoSpan, _ := tracer.StartSpanFromContext(ctx, "mongo.query",
+				tracer.Tag(ext.DBType, "mongo"),              // Specifies the database type
+				tracer.Tag(ext.SpanType, "db"),               // Classifies this as a database span
+				tracer.Tag(ext.DBInstance, "reservation-db"), // Specifies the database name
+				tracer.Tag(ext.SpanKind, ext.SpanKindClient), // Classifies the span as a client span
+				tracer.Tag(ext.DBStatement, fmt.Sprintf( // Describes the query operation
+					"db.reservation.find({hotelId: %s, inDate: %s, outDate: %s})",
+					hotelId, indate, outdate,
+				)),
+				tracer.Tag(ext.ResourceName, "MongoDB: Find Reservations"), // A human-readable name for the operation
+				tracer.Tag("hotel_id", hotelId),                            // Captures the specific hotel ID being queried
+				tracer.Tag("reservation.in_date", indate),                  // Captures the start date of the reservation
+				tracer.Tag("reservation.out_date", outdate),                // Captures the end date of the reservation
+			)
+			defer mongoSpan.Finish() // Ensure the span is always closed
+
+			// Execute the query and handle any errors
 			err := c.Find(&bson.M{"hotelId": hotelId, "inDate": indate, "outDate": outdate}).All(&reserve)
 			if err != nil {
-				log.Panic().Msgf("Tried to find hotelId [%v] from date [%v] to date [%v], but got error", hotelId, indate, outdate, err.Error())
+				mongoSpan.SetTag(ext.Error, true)              // Indicates an error occurred
+				mongoSpan.SetTag("error.message", err.Error()) // Provides the error message for visibility
+				log.Panic().Msgf("Tried to find hotelId [%v] from date [%v] to date [%v], but got error: %v", hotelId, indate, outdate, err)
 			}
+
+			// Add metadata after successful query execution
+			mongoSpan.SetTag("reservations.count", len(reserve)) // Tag for the number of reservations found
 
 			for _, r := range reserve {
 				count += r.Number
 			}
-
-			memc_date_num_map[memc_key] = count + int(req.RoomNumber)
-
+			memc_date_num_map[memcKey] = count + int(req.RoomNumber)
 		} else {
-			log.Panic().Msgf("Tried to get memc_key [%v], but got memmcached error = %s", memc_key, err)
+			iterationSpan.SetTag(ext.Error, true)
+			iterationSpan.SetTag("error.message", err.Error())
+			log.Panic().Msgf("Tried to get memc_key [%v], but got memcached error = %s", memcKey, err)
 		}
 
-		// check capacity
-		// check memc capacity
-		memc_cap_key := hotelId + "_cap"
-		item, err = s.MemcClient.Get(memc_cap_key)
-		hotel_cap := 0
+		// Memcached Get for hotel capacity
+		memcCapKey := hotelId + "_cap"
+		memcCapGetSpan, ctx := tracer.StartSpanFromContext(ctx, "memcached.get", tracer.ResourceName("GetHotelCapacity"))
+		memcCapGetSpan.SetTag("cacheKey", memcCapKey)
+		memcCapGetSpan.SetTag(ext.Component, "memcached")
+		item, err = s.MemcClient.Get(memcCapKey)
+		memcCapGetSpan.Finish()
+
+		hotelCap := 0
 		if err == nil {
-			// memcached hit
-			hotel_cap, _ = strconv.Atoi(string(item.Value))
-			log.Trace().Msgf("memcached hit %s = %d", memc_cap_key, hotel_cap)
+			// Memcached hit
+			hotelCap, _ = strconv.Atoi(string(item.Value))
+			log.Trace().Msgf("Memcached hit %s = %d", memcCapKey, hotelCap)
 		} else if err == memcache.ErrCacheMiss {
-			// memcached miss
+			// Memcached miss
 			var num number
+			mongoCapSpan, ctx := tracer.StartSpanFromContext(ctx, "mongo.query", tracer.ResourceName("FindHotelCapacity"))
+			mongoCapSpan.SetTag(ext.DBInstance, "reservation-db")
+			mongoCapSpan.SetTag(ext.DBStatement, fmt.Sprintf("Find capacity for hotelId=%s", hotelId))
 			err = c1.Find(&bson.M{"hotelId": hotelId}).One(&num)
-			if err != nil {
-				log.Panic().Msgf("Tried to find hotelId [%v], but got error", hotelId, err.Error())
-			}
-			hotel_cap = int(num.Number)
+			mongoCapSpan.Finish()
 
-			// write to memcache
-			s.MemcClient.Set(&memcache.Item{Key: memc_cap_key, Value: []byte(strconv.Itoa(hotel_cap))})
+			if err != nil {
+				iterationSpan.SetTag(ext.Error, true)
+				iterationSpan.SetTag("error.message", err.Error())
+				log.Panic().Msgf("Tried to find hotelId [%v], but got error: %v", hotelId, err)
+			}
+			hotelCap = int(num.Number)
+
+			// Memcached Set for hotel capacity
+			memcCapSetSpan, ctx := tracer.StartSpanFromContext(ctx, "memcached.set", tracer.ResourceName("SetHotelCapacity"))
+			memcCapSetSpan.SetTag("cacheKey", memcCapKey)
+			memcCapSetSpan.SetTag(ext.Component, "memcached")
+			s.MemcClient.Set(&memcache.Item{Key: memcCapKey, Value: []byte(strconv.Itoa(hotelCap))})
+			memcCapSetSpan.Finish()
 		} else {
-			log.Panic().Msgf("Tried to get memc_cap_key [%v], but got memmcached error = %s", memc_cap_key, err)
+			iterationSpan.SetTag(ext.Error, true)
+			iterationSpan.SetTag("error.message", err.Error())
+			log.Panic().Msgf("Tried to get memc_cap_key [%v], but got memcached error = %s", memcCapKey, err)
 		}
 
-		if count+int(req.RoomNumber) > hotel_cap {
+		// Check capacity
+		if count+int(req.RoomNumber) > hotelCap {
 			return res, nil
 		}
 		indate = outdate
 	}
 
-	// only update reservation number cache after check succeeds
+	// Memcached Set for reservation counts
 	for key, val := range memc_date_num_map {
+		memcSetSpan, _ := tracer.StartSpanFromContext(ctx, "memcached.set", tracer.ResourceName("UpdateReservationCount"))
+		memcSetSpan.SetTag("cacheKey", key)
+		memcSetSpan.SetTag(ext.Component, "memcached")
 		s.MemcClient.Set(&memcache.Item{Key: key, Value: []byte(strconv.Itoa(val))})
+		memcSetSpan.Finish()
 	}
 
 	inDate, _ = time.Parse(
@@ -211,17 +357,33 @@ func (s *Server) MakeReservation(ctx context.Context, req *pb.Request) (*pb.Resu
 	indate = inDate.String()[0:10]
 
 	for inDate.Before(outDate) {
+		// Start a span for each reservation insertion
+		span, _ := tracer.StartSpanFromContext(ctx, "mongo.insert", tracer.ResourceName("InsertReservation"))
+		span.SetTag(ext.DBInstance, "reservation-db")
+		span.SetTag(ext.DBStatement, "Insert reservation")
+		span.SetTag("hotelId", hotelId)
+		span.SetTag("customerName", req.CustomerName)
+		span.SetTag("inDate", inDate.Format("2006-01-02"))
+		span.SetTag("outDate", inDate.AddDate(0, 0, 1).Format("2006-01-02"))
+
 		inDate = inDate.AddDate(0, 0, 1)
 		outdate := inDate.String()[0:10]
+
 		err := c.Insert(&reservation{
 			HotelId:      hotelId,
 			CustomerName: req.CustomerName,
 			InDate:       indate,
 			OutDate:      outdate,
-			Number:       int(req.RoomNumber)})
+			Number:       int(req.RoomNumber),
+		})
+
 		if err != nil {
-			log.Panic().Msgf("Tried to insert hotel [hotelId %v], but got error", hotelId, err.Error())
+			span.SetTag(ext.Error, true)
+			span.SetTag("error.message", err.Error())
+			log.Panic().Msgf("Tried to insert hotel [hotelId %v], but got error: %v", hotelId, err)
 		}
+
+		span.Finish() // Finish the span after each iteration
 		indate = outdate
 	}
 
@@ -254,7 +416,9 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 		resMap[hotelId] = true
 		keysMap[hotelId+"_cap"] = struct{}{}
 	}
-	capMemSpan, _ := opentracing.StartSpanFromContext(ctx, "memcached_capacity_get_multi_number")
+	capMemSpan, ctx := tracer.StartSpanFromContext(ctx, "memcached.query", tracer.ResourceName("memcached_capacity_get_multi_number"))
+	capMemSpan.SetTag(ext.Component, "memcached")
+	capMemSpan.SetTag(ext.SpanType, "cache")
 	capMemSpan.SetTag("span.kind", "client")
 	cacheMemRes, err := s.MemcClient.GetMulti(hotelMemKeys)
 	capMemSpan.Finish()
@@ -281,13 +445,28 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 			queryMissKeys = append(queryMissKeys, strings.Split(k, "_")[0])
 		}
 		nums := []number{}
-		capMongoSpan, _ := opentracing.StartSpanFromContext(ctx, "mongodb_capacity_get_multi_number")
-		capMongoSpan.SetTag("span.kind", "client")
-		err = c1.Find(bson.M{"hotelId": bson.M{"$in": queryMissKeys}}).All(&nums) 
-		capMongoSpan.Finish()
+		// MongoDB query for capacity with Datadog tracing
+		capMongoSpan, _ := tracer.StartSpanFromContext(ctx, "mongo.query",
+			tracer.ResourceName("MongoDB: Find Capacities"),                        // Human-readable operation name
+			tracer.Tag(ext.DBType, "mongo"),                                        // Specifies the database type
+			tracer.Tag(ext.SpanKind, ext.SpanKindClient),                           // Classifies the span as a client span
+			tracer.Tag(ext.DBInstance, "reservation-db"),                           // Specifies the database name
+			tracer.Tag(ext.DBStatement, "db.capacity.find({hotelId: {$in: ...}})"), // Describes the database query
+			tracer.Tag("query.keys.count", len(queryMissKeys)),                     // Captures the number of keys being queried
+		)
+		defer capMongoSpan.Finish() // Ensure the span is always closed
+
+		// Execute the query and handle any errors
+		err = c1.Find(bson.M{"hotelId": bson.M{"$in": queryMissKeys}}).All(&nums)
 		if err != nil {
-			log.Panic().Msgf("Tried to find hotelId [%v], but got error", misKeys, err.Error())
+			capMongoSpan.SetTag(ext.Error, true)              // Marks the span with an error
+			capMongoSpan.SetTag("error.message", err.Error()) // Adds the error message for context
+			log.Panic().Msgf("Tried to find hotelId [%v], but got error: %v", queryMissKeys, err)
 		}
+
+		// Add metadata after query execution
+		capMongoSpan.SetTag("results.count", len(nums)) // Tags the count of results retrieved
+
 		for _, num := range nums {
 			cacheCap[num.HotelId] = num.Number
 			// we don't care set successfully or not
@@ -323,7 +502,10 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 		hotelId  string
 		checkRes bool
 	}
-	reserveMemSpan, _ := opentracing.StartSpanFromContext(ctx, "memcached_reserve_get_multi_number")
+	reserveMemSpan, ctx := tracer.StartSpanFromContext(ctx, "memcached_reservation_get_multi", tracer.ResourceName("MakeReservation"))
+	reserveMemSpan.SetTag(ext.Component, "memcached")
+	reserveMemSpan.SetTag(ext.SpanType, "cache")
+
 	ch := make(chan taskRes)
 	reserveMemSpan.SetTag("span.kind", "client")
 	// check capacity in memcached and mongodb
@@ -370,31 +552,69 @@ func (s *Server) CheckAvailability(ctx context.Context, req *pb.Request) (*pb.Re
 					defer tmpSess.Close()
 					queryItem := queryMap[comm]
 					c := tmpSess.DB("reservation-db").C("reservation")
-					reserveMongoSpan, _ := opentracing.StartSpanFromContext(ctx, "mongodb_capacity_get_multi_number"+comm)
-					reserveMongoSpan.SetTag("span.kind", "client")
-					err := c.Find(&bson.M{"hotelId": queryItem["hotelId"], "inDate": queryItem["startDate"], "outDate": queryItem["endDate"]}).All(&reserve)
-					reserveMongoSpan.Finish()
+
+					// MongoDB query tracing with Datadog
+					reserveMongoSpan, ctx := tracer.StartSpanFromContext(ctx, "mongo.query",
+						tracer.ResourceName("MongoDB: Find Reservation"), // Human-readable operation name
+						tracer.Tag(ext.DBType, "mongo"),                  // Specifies the database type
+						tracer.Tag(ext.SpanKind, ext.SpanKindClient),     // Classifies the span as a client span
+						tracer.Tag(ext.DBInstance, "reservation-db"),     // Specifies the database name
+						tracer.Tag(ext.DBStatement, fmt.Sprintf("db.reservation.find({hotelId: %s, inDate: %s, outDate: %s})",
+							queryItem["hotelId"], queryItem["startDate"], queryItem["endDate"])), // Describes the query
+					)
+					defer reserveMongoSpan.Finish() // Ensure the span is closed
+
+					// Execute the query
+					err := c.Find(&bson.M{
+						"hotelId": queryItem["hotelId"],
+						"inDate":  queryItem["startDate"],
+						"outDate": queryItem["endDate"],
+					}).All(&reserve)
+
+					// Handle errors
 					if err != nil {
-						log.Panic().Msgf("Tried to find hotelId [%v] from date [%v] to date [%v], but got error",
-							queryItem["hotelId"], queryItem["startDate"], queryItem["endDate"], err.Error())
+						reserveMongoSpan.SetTag(ext.Error, true)              // Marks the span as erroneous
+						reserveMongoSpan.SetTag("error.message", err.Error()) // Adds the error message for context
+						log.Panic().Msgf("Tried to find hotelId [%v] from date [%v] to date [%v], but got error: %v",
+							queryItem["hotelId"], queryItem["startDate"], queryItem["endDate"], err)
 					}
+
+					// Add metadata after successful query execution
+					reserveMongoSpan.SetTag("results.count", len(reserve)) // Captures the number of results returned
+
 					var count int
 					for _, r := range reserve {
 						log.Trace().Msgf("reservation check reservation number = %d", queryItem["hotelId"])
 						count += r.Number
 					}
-					// update memcached
-					go s.MemcClient.Set(&memcache.Item{Key: comm, Value: []byte(strconv.Itoa(count))})
+
+					// Memcached update tracing
+					memcacheSpan, ctx := tracer.StartSpanFromContext(ctx, "memcached.set", tracer.ResourceName("UpdateReservationCache"))
+					memcacheSpan.SetTag(ext.Component, "memcached")
+					memcacheSpan.SetTag(ext.PeerService, "memcached-reservation")
+					memcacheSpan.SetTag("hotelId", queryItem["hotelId"])
+					memcacheSpan.SetTag("cacheKey", comm)
+					memcacheSpan.SetTag("reservationCount", count)
+
+					err = s.MemcClient.Set(&memcache.Item{Key: comm, Value: []byte(strconv.Itoa(count))})
+					memcacheSpan.Finish()
+
+					if err != nil {
+						log.Warn().Msgf("Failed to update memcached for key [%s]: %v", comm, err)
+					}
+
 					var res bool
 					if count+int(req.RoomNumber) <= cacheCap[queryItem["hotelId"]] {
 						res = true
 					}
+
 					ch <- taskRes{
 						hotelId:  queryItem["hotelId"],
 						checkRes: res,
 					}
 				}(command)
 			}
+
 		}
 	}
 
